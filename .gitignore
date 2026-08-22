@@ -21,3 +21,6 @@ desktop.ini
 # Editor
 .vscode/
 .idea/
+
+# Repo ngoai clone ve de tham khao - khong commit vao DroneV2
+testZone/ardupilot/
