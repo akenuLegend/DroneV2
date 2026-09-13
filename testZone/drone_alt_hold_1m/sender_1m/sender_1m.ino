@@ -2,8 +2,8 @@
  * SENDER_1M - tram mat dat toi gian cho DRONE_ALT_HOLD_1M.
  *
  * Khoi dong CHI gui heartbeat, tuyet doi khong tu ARM.
- * Lenh Serial 115200: HELP, ARM, TAKEOFF, LAND, DISARM, KILL YES,
- *                     HOVER <1050..1750>, STATUS.
+ * Lenh nhanh: 0=STATUS, 1=ARM, 2=TAKEOFF, 3=LAND, 4=DISARM,
+ *             5 <us>=HOVER, 9=KILL. Lenh chu cu van duoc giu nguyen.
  * Moi action duoc gui lai 1.2 s voi cung sequence; drone xu ly dung mot lan.
  */
 
@@ -16,7 +16,7 @@
 #define CMD_MAGIC 0xC3
 #define CMD_VER 1
 #define TELEM_MAGIC 0xD1
-#define TELEM_VER 2
+#define TELEM_VER 5
 #define HEARTBEAT_MS 200UL
 #define ACTION_REPEAT_MS 1200UL
 #define LINK_TIMEOUT_MS 3000UL
@@ -63,20 +63,34 @@ struct __attribute__((packed)) TelemPacket {
   float rangeAltitudeM, baroAltitudeM;
   int16_t altitudeCorrectionUs;
   uint16_t rangeAgeMs, baroAgeMs;
-  uint8_t altitudeSource, rangeStrength, lastCommand, reserved;
+  uint8_t altitudeSource, rangeStrength, lastCommand, transitionPhase;
+  float flowForwardMps, flowRightMps;
+  float positionForwardM, positionRightM;
+  float positionPitchDeg, positionRollDeg;
+  uint16_t flowAgeMs;
+  uint8_t flowQuality, flowReserved;
+  float altitudeVelocitySetpointMps, altitudeIntegralUs;
+  uint32_t configSignature;
+  uint16_t controlDtUs, controlDtMaxUs, controlOverruns;
+  uint16_t mtfRateHz10, mtfGapMaxUs;
+  uint16_t bmpRateHz10, bmpReadMaxUs, auxWaitMaxUs;
+  uint16_t altitudeGapMaxUs, uartBacklogMax;
+  uint16_t mtfBadCrc, mtfStale, bmpReadFail, auxLockMiss;
 };
-static_assert(sizeof(TelemPacket) == 180, "TelemPacket khong khop drone");
+static_assert(sizeof(TelemPacket) == 248, "TelemPacket khong khop drone");
+static_assert(sizeof(TelemPacket) <= 250, "ESP-NOW telemetry vuot 250 byte");
 
-struct RxMessage { uint8_t len; uint8_t data[200]; };
+struct RxMessage { uint8_t len; uint8_t data[250]; };
 static QueueHandle_t rxQueue = NULL;
 static volatile bool sendPending = false;
 static volatile uint32_t txOk = 0, txFail = 0, rxDrop = 0;
 static uint32_t lastSendMs = 0, lastTelemMs = 0, lastPrintMs = 0;
 static uint32_t sendPendingSinceMs = 0;
+static bool sendPendingWarned = false;
 static uint32_t lastNoTelemReportMs = 0;
 static uint32_t lastLostReportMs = 0;
 static uint16_t nextSequence = 1;
-static uint16_t hoverUs = 1470;
+static uint16_t hoverUs = 1400;
 static uint8_t repeatCommand = CMD_HEARTBEAT;
 static uint16_t repeatSequence = 0;
 static uint32_t repeatUntilMs = 0;
@@ -107,6 +121,20 @@ static const char *modeName(uint8_t mode) {
   }
 }
 
+static const char *phaseName(uint8_t phase) {
+  switch (phase) {
+    case 1: return "SPOOL_UP";
+    case 2: return "GROUND_TRANSITION";
+    case 3: return "CONTROLLED_ASCENT";
+    case 4: return "ALTITUDE_CAPTURE";
+    case 5: return "CONTROLLED_DESCENT";
+    case 6: return "GROUND_APPROACH";
+    case 7: return "TOUCHDOWN_DETECTION";
+    case 8: return "MOTOR_RAMP_DOWN";
+    default: return "NONE";
+  }
+}
+
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 1, 0)
 void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
   (void)info;
@@ -115,7 +143,7 @@ void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
   (void)mac;
 #endif
   if (status == ESP_NOW_SEND_SUCCESS) txOk = txOk + 1; else txFail = txFail + 1;
-  sendPending = false;
+  __atomic_store_n(&sendPending, false, __ATOMIC_RELEASE);
 }
 
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
@@ -132,19 +160,32 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 }
 
 static bool sendControl(uint8_t command, uint16_t sequence) {
-  if (sendPending && (uint32_t)(millis() - sendPendingSinceMs) <= SEND_TIMEOUT_MS) return false;
-  if (sendPending) {
-    sendPending = false;
-    Serial.println("[LINK] callback gui timeout; thu lai.");
+  const uint32_t now = millis();
+  if (__atomic_load_n(&sendPending, __ATOMIC_ACQUIRE)) {
+    if ((uint32_t)(now - sendPendingSinceMs) > SEND_TIMEOUT_MS && !sendPendingWarned) {
+      // Khong clear de retry mu: callback cu den tre co the xoa trang thai cua
+      // packet moi. Mat callback se de watchdog link cua drone ha canh an toan.
+      sendPendingWarned = true;
+      Serial.println("[LINK] callback gui cham; cho callback, khong chong packet.");
+    }
+    return false;
   }
   ControlPacket p = {};
   p.magic = CMD_MAGIC; p.ver = CMD_VER; p.command = command;
-  p.sequence = sequence; p.targetCm = 100; p.hoverUs = hoverUs;
+  p.sequence = sequence; p.targetCm = 50; p.hoverUs = hoverUs;
   p.crc = crc16Ccitt((const uint8_t *)&p, sizeof(p) - sizeof(p.crc));
+  // Publish pending truoc esp_now_send(): callback co the chay tren core khac
+  // truoc khi ham tra ve, va khi do store(false) cua callback van thang.
+  sendPendingSinceMs = now;
+  sendPendingWarned = false;
+  __atomic_store_n(&sendPending, true, __ATOMIC_RELEASE);
   const esp_err_t result = esp_now_send(peerMac, (const uint8_t *)&p, sizeof(p));
-  lastSendMs = millis();
-  if (result != ESP_OK) { txFail = txFail + 1; return false; }
-  sendPending = true; sendPendingSinceMs = millis();
+  lastSendMs = now;
+  if (result != ESP_OK) {
+    __atomic_store_n(&sendPending, false, __ATOMIC_RELEASE);
+    txFail = txFail + 1;
+    return false;
+  }
   return true;
 }
 
@@ -156,14 +197,15 @@ static void queueAction(uint8_t command) {
 }
 
 static void printHelp() {
-  Serial.println("\nLenh an toan:");
-  Serial.println("  ARM          kiem tra pre-arm 2s, motor chuyen ARMED_IDLE");
-  Serial.println("  TAKEOFF      cat canh va giu 1.00m");
-  Serial.println("  LAND         ha canh co dieu khien");
-  Serial.println("  DISARM       chi duoc chap nhan khi ARMED_IDLE/da o dat");
-  Serial.println("  KILL YES     tat khan cap; drone se khoa den khi reset");
-  Serial.println("  HOVER n      dat base throttle khi DISARMED (1050..1750us)");
-  Serial.println("  STATUS       in telemetry moi nhat");
+  Serial.println("\nSo | Lenh chu     | Tac dung");
+  Serial.println(" 0  | STATUS       | in telemetry moi nhat");
+  Serial.println(" 1  | ARM          | kiem tra pre-arm 2s, vao ARMED_IDLE");
+  Serial.println(" 2  | TAKEOFF      | ramp tu ga hien tai, xac nhan roi dat, giu 0.50m");
+  Serial.println(" 3  | LAND         | ha canh co dieu khien");
+  Serial.println(" 4  | DISARM       | chi khi ARMED_IDLE/da o dat");
+  Serial.println(" 5 n| HOVER n      | dat hover 1050..1750us khi DISARMED");
+  Serial.println(" 9  | KILL YES     | TAT KHAN CAP, khoa den khi reset");
+  Serial.println(" ?  | HELP         | in bang nay");
 }
 
 static void printStatus() {
@@ -173,17 +215,40 @@ static void printStatus() {
                   (millis() - lastTelemMs) * 0.001f);
     return;
   }
-  const char *source = latest.altitudeSource == 1 ? "MTF" :
-                       latest.altitudeSource == 2 ? "BMP" : "NONE";
-  Serial.printf("[%s] z=%+.3fm sp=%.3fm vz=%+.3fm/s src=%s corr=%+dus | "
+  const char *source = latest.altitudeSource == 3 ? "FUSED" :
+                       latest.altitudeSource == 1 ? "MTF" :
+                       latest.altitudeSource == 2 ? "BMP" :
+                       latest.altitudeSource == 4 ? "COAST" : "NONE";
+  const bool flowFresh = (latest.flags & 0x20U) != 0;
+  const float positionRadiusM = hypotf(latest.positionForwardM, latest.positionRightM);
+  Serial.printf("[%s/%s] z=%+.3fm sp=%.3fm vz=%+.3fm/s src=%s corr=%+dus | "
                 "P=%+.1f R=%+.1f T=%d H=%d M=%d/%d/%d/%d | rangeAge=%ums "
-                "baroAge=%ums str=%u | %s\n",
-                modeName(latest.mode), latest.altitudeM, latest.altitudeSetpointM,
+                "baroAge=%ums str=%u | FLOW=%s q=%u age=%ums "
+                "vFR=%+.2f/%+.2f posFR=%+.2f/%+.2f r=%.2fm "
+                "tiltPR=%+.1f/%+.1f | %s\n",
+                modeName(latest.mode), phaseName(latest.transitionPhase),
+                latest.altitudeM, latest.altitudeSetpointM,
                 latest.verticalSpeedMps, source, latest.altitudeCorrectionUs,
                 latest.pitch, latest.roll, latest.throttle, latest.hover,
                 latest.m1, latest.m2, latest.m3, latest.m4,
                 latest.rangeAgeMs, latest.baroAgeMs, latest.rangeStrength,
+                flowFresh ? "OK" : "--", latest.flowQuality, latest.flowAgeMs,
+                latest.flowForwardMps, latest.flowRightMps,
+                latest.positionForwardM, latest.positionRightM,
+                positionRadiusM,
+                latest.positionPitchDeg, latest.positionRollDeg,
                 latest.reason);
+  Serial.printf("  cfg=%08lX loop=%uHz dt=%u/%uus ov=%u | ALTCTL vsp=%+.3f I=%+.1fus | "
+                "MTF=%.1fHz gap<=%uus bad/stale=%u/%u backlog=%u | "
+                "BMP=%.1fHz read<=%uus aux<=%uus miss/fail=%u/%u altGap<=%uus\n",
+                (unsigned long)latest.configSignature, latest.loopHz,
+                latest.controlDtUs, latest.controlDtMaxUs, latest.controlOverruns,
+                latest.altitudeVelocitySetpointMps, latest.altitudeIntegralUs,
+                latest.mtfRateHz10 * 0.1f, latest.mtfGapMaxUs,
+                latest.mtfBadCrc, latest.mtfStale, latest.uartBacklogMax,
+                latest.bmpRateHz10 * 0.1f, latest.bmpReadMaxUs,
+                latest.auxWaitMaxUs, latest.auxLockMiss, latest.bmpReadFail,
+                latest.altitudeGapMaxUs);
 }
 
 static void uppercase(char *s) {
@@ -199,27 +264,38 @@ static void processLine() {
   while (inputLine[0] == ' ') memmove(inputLine, inputLine + 1, strlen(inputLine));
   uppercase(inputLine);
 
+  // Alias so de thao tac nhanh tren Serial Monitor; command chu van tuong thich.
+  if (!strcmp(inputLine, "0")) strcpy(inputLine, "STATUS");
+  else if (!strcmp(inputLine, "1")) strcpy(inputLine, "ARM");
+  else if (!strcmp(inputLine, "2")) strcpy(inputLine, "TAKEOFF");
+  else if (!strcmp(inputLine, "3")) strcpy(inputLine, "LAND");
+  else if (!strcmp(inputLine, "4")) strcpy(inputLine, "DISARM");
+  else if (!strcmp(inputLine, "9")) strcpy(inputLine, "KILL YES");
+
   if (!strcmp(inputLine, "HELP") || !strcmp(inputLine, "H") || !strcmp(inputLine, "?"))
     printHelp();
   else if (!strcmp(inputLine, "STATUS") || !strcmp(inputLine, "S")) printStatus();
   else if (!strcmp(inputLine, "ARM")) {
-    if (!telemetryFresh() || latest.mode != 0 || latest.altitudeSource != 1 ||
-        latest.rangeAgeMs > 250 || latest.baroAgeMs > 250)
-      Serial.println("[TX] ARM bi chan: can telemetry moi, DISARMED, MTF+BMP san sang.");
+    if (!telemetryFresh() || latest.mode != 0 || latest.altitudeSource == 0 ||
+        latest.rangeAgeMs > 250 || latest.baroAgeMs > 250 ||
+        (latest.flags & 0x20U) == 0)
+      Serial.println("[TX] ARM bi chan: can DISARMED + MTF/BMP/flow san sang.");
     else { Serial.println("[TX] ARM (drone van phai dat pre-arm checks)"); queueAction(CMD_ARM); }
   } else if (!strcmp(inputLine, "TAKEOFF")) {
-    if (!telemetryFresh() || latest.mode != 1 || latest.altitudeSource != 1 ||
-        latest.rangeAgeMs > 250 || latest.baroAgeMs > 250)
-      Serial.println("[TX] TAKEOFF bi chan: can telemetry moi + ARMED_IDLE + MTF/BMP.");
-    else { Serial.println("[TX] TAKEOFF -> 1.00m"); queueAction(CMD_TAKEOFF); }
+    if (!telemetryFresh() || latest.mode != 1 || latest.altitudeSource == 0 ||
+        latest.rangeAgeMs > 250 || latest.baroAgeMs > 250 ||
+        (latest.flags & 0x20U) == 0)
+      Serial.println("[TX] TAKEOFF bi chan: can ARMED_IDLE + MTF/BMP/flow san sang.");
+    else { Serial.println("[TX] TAKEOFF -> 0.50m"); queueAction(CMD_TAKEOFF); }
   } else if (!strcmp(inputLine, "LAND")) {
     Serial.println("[TX] LAND"); queueAction(CMD_LAND);
   } else if (!strcmp(inputLine, "DISARM")) {
     Serial.println("[TX] DISARM"); queueAction(CMD_DISARM);
   } else if (!strcmp(inputLine, "KILL YES")) {
     Serial.println("[TX] !!! KILL KHAN CAP !!!"); queueAction(CMD_KILL);
-  } else if (!strncmp(inputLine, "HOVER ", 6)) {
-    char *end = NULL; const long value = strtol(inputLine + 6, &end, 10);
+  } else if (!strncmp(inputLine, "HOVER ", 6) || !strncmp(inputLine, "5 ", 2)) {
+    const char *valueText = inputLine[0] == '5' ? inputLine + 2 : inputLine + 6;
+    char *end = NULL; const long value = strtol(valueText, &end, 10);
     if (*end || value < 1050 || value > 1750) Serial.println("[TX] HOVER khong hop le.");
     else if (!telemetryFresh() || latest.mode != 0)
       Serial.println("[TX] HOVER bi chan: can telemetry moi va drone DISARMED.");

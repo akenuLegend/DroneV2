@@ -2,7 +2,7 @@
  * DRONE_ALT_HOLD_1M - ESP32 + MPU6050 + BMP388 + MTF01P + 4x ESC
  *
  * Nen tang: testZone/drone_pilot/drone_pilot.ino
- * Nang cap: cat canh co kiem soat va giu cao do tuong doi 1.00 m.
+ * Nang cap: cat canh co kiem soat va giu cao do 0.50 m.
  *
  * CHAN   M1(FL,CW)=26  M2(FR,CCW)=13  M3(BR,CW)=14  M4(BL,CCW)=27
  *        MPU6050 SDA=32 SCL=33 | BMP388 SDA=21 SCL=22
@@ -16,7 +16,7 @@
  *   - Khoa an toan chi go duoc bang RESET board.
  */
 
-#define ENABLE_OLED             0   // BMP388 dung bus 21/22; bat OLED chi sau khi test timing
+#define ENABLE_OLED             1   // SSD1306 128x64 dung chung bus AUX voi BMP388
 #define ENABLE_AUTO_CALIB       1
 
 #include <Wire.h>
@@ -58,6 +58,7 @@ static const int ESC_MIN_US = 1000, ESC_MAX_US = 2000;
 #define ALT_TASK_CORE 0
 #define ALT_TASK_PRIO 2
 #define ALT_TASK_STACK 6144
+#define AUX_MUTEX_WAIT_MS 2
 
 #if ENABLE_OLED
   #define OLED_SDA AUX_SDA
@@ -95,8 +96,12 @@ static const uint8_t espnowLmk[ESP_NOW_KEY_LEN] = {
 #define TELEM_TASK_CORE  0
 #define TELEM_TASK_STACK 3072
 #define TELEM_MAGIC      0xD1
-#define TELEM_VER        2
+#define TELEM_VER        5
 #define TELEM_SERIAL     0
+
+// ID thu cong cua manifest cau hinh flight. Tang khi layout/tham so flight doi;
+// build date/time in luc khoi dong tach rieng de truy vet dung binary.
+static const uint32_t FLIGHT_CONFIG_SIGNATURE = 0xA41F1001UL;
 
 // -- Nhip --
 static const uint32_t CONTROL_HZ     = 250;
@@ -108,15 +113,15 @@ static const uint32_t TELEM_US       = 1000000UL / TELEM_HZ;
 
 // -- Ga --
 static const int   IDLE_THROTTLE      = 1000;
-// 1470 us la diem lift da co trong profile thu nghiem cu. PHAI do lai tren gia
-// thu va co the doi bang lenh HOVER khi DISARMED truoc chuyen bay.
-static const int   HOVER_DEFAULT      = 1470;
+// Tren khung dang test, 1400 us da bat dau nang con 1500 us leo rat manh.
+// 1430 us chi la feed-forward hien tai, chua duoc calibrate theo pin/tai.
+static const int   HOVER_DEFAULT      = 1430;
 static const int   MOTOR_MIN_US       = 1050;
 static const int   HOVER_MIN_ALLOWED  = 1050;
 static const int   HOVER_MAX_ALLOWED  = 1750;
-static const float THROTTLE_BAND_PCT  = 0.15f;
+static const float THROTTLE_BAND_PCT  = 0.25f;
 static const int   THROTTLE_BAND_MIN  = 60;
-static const int   THROTTLE_BAND_MAX  = 250;
+static const int   THROTTLE_BAND_MAX  = 350;
 static const float HOVER_SLEW_US_PER_S = 100.0f;
 
 // -- Arm / an toan --
@@ -128,32 +133,119 @@ static const float TRIP_RAMP_S       = 1.5f;
 static const float LEVEL_OFFSET_MAX  = 10.0f;
 static const int   SENSOR_FAIL_LIMIT = (int)(SAMPLE_HZ / 20);
 
-// -- Tu dong cat canh / giu 1 m --
-static const float ALT_TARGET_M             = 1.00f;
-static const float ALT_SETPOINT_SLEW_MPS    = 0.35f;
-static const float TAKEOFF_SPOOL_S           = 1.00f;
-static const float ALT_LAND_SLEW_MPS        = 0.22f;
-static const float ALT_POS_KP               = 1.20f;
-static const float ALT_VEL_MAX_UP_MPS       = 0.45f;
-static const float ALT_VEL_MAX_DOWN_MPS     = 0.35f;
-static const float ALT_VEL_KP_US_PER_MPS    = 230.0f;
-static const float ALT_VEL_KI_US_PER_M      = 85.0f;
-static const float ALT_I_LIMIT_US           = 100.0f;
-static const float ALT_CORRECTION_LIMIT_US  = 180.0f;
+// -- Tu dong cat canh / giu 0.50 m --
+// MTF nam cao hon diem thap nhat cua drone 12 cm: tru offset nay de ra clearance.
+static const float MTF_SENSOR_TO_DRONE_BOTTOM_M = 0.12f;
+static const float ALT_TARGET_M             = 0.50f;
+static const float ALT_SETPOINT_SLEW_MPS    = 0.12f;
+// TAKEOFF ramp tu output hien tai; 1350 us chi la moc vao GROUND_TRANSITION.
+static const int   TAKEOFF_START_US          = 1350;
+static const float TAKEOFF_RAMP_US_PER_S     = 40.0f;
+static const float TAKEOFF_LIFTOFF_M         = 0.06f;
+static const float TAKEOFF_LIFTOFF_VZ_MPS    = 0.10f;
+static const float TAKEOFF_LIFTOFF_CONFIRM_S = 0.15f;
+// Task 4: chi ap dung khi con cham dat va trong handover ngay sau lift.
+static const float TAKEOFF_GROUND_MAX_TILT_DEG      = 8.0f;
+static const float TAKEOFF_GROUND_ABORT_ANGLE_DEG   = 12.0f;
+static const float TAKEOFF_GROUND_ABORT_RATE_DPS    = 45.0f;
+static const float TAKEOFF_GROUND_ABORT_CONFIRM_S   = 0.10f;
+static const float TAKEOFF_LEVEL_SLEW_DEG_PER_S     = 3.0f;
+static const float TAKEOFF_GROUND_MOTOR_DELTA_US    = 50.0f;
+static const float TAKEOFF_ATTITUDE_TRANSFER_S      = 0.50f;
+static const float ALT_LAND_SLEW_MPS        = 0.08f;
+static const float ALT_LAND_NEAR_SLEW_MPS   = 0.04f;
+static const float LAND_NEAR_GROUND_M       = 0.40f;
+static const float ALT_THROTTLE_UP_US_PER_S         = 90.0f;
+static const float ALT_THROTTLE_DOWN_US_PER_S       = 100.0f;
+static const float LAND_THROTTLE_UP_US_PER_S        = 55.0f;
+static const float LAND_THROTTLE_DOWN_US_PER_S      = 50.0f;
+static const float LAND_NEAR_THROTTLE_DOWN_US_PER_S = 35.0f;
+static const float LAND_THROTTLE_HEADROOM_US         = 50.0f;
+static const float LAND_THROTTLE_MAX_US              = 1470.0f;
+static const float BLIND_THROTTLE_DOWN_US_PER_S     = 25.0f;
+static const float ALT_POS_KP               = 0.70f;
+static const float ALT_POS_DEADBAND_M       = 0.015f;
+static const float ALT_VEL_DEADBAND_MPS     = 0.025f;
+static const float ALT_VEL_MAX_UP_MPS       = 0.20f;
+static const float ALT_VEL_MAX_DOWN_MPS     = 0.12f;
+static const float ALT_VEL_ACCEL_UP_MPS2    = 0.20f;
+static const float ALT_VEL_ACCEL_DOWN_MPS2  = 0.35f;
+static const float ALT_VEL_KP_US_PER_MPS    = 80.0f;
+static const float ALT_VEL_KI_US_PER_M      = 30.0f;
+static const float ALT_I_LIMIT_US           = 40.0f;
+static const float ALT_CORRECTION_UP_US     = 70.0f;
+static const float ALT_CORRECTION_DOWN_US   = 45.0f;
 static const float ALT_HOLD_TOLERANCE_M     = 0.08f;
 static const float ALT_MAX_M                = 1.60f;
 static const float ALT_LANDED_M             = 0.10f;
-static const float ALT_LANDED_VZ_MPS        = 0.18f;
-static const float ALT_LANDED_CONFIRM_S     = 0.80f;
+static const float ALT_LANDED_VZ_MPS        = 0.25f;
+static const float ALT_LANDED_CONFIRM_S     = 0.40f;
+static const float LAND_TOUCHDOWN_DOWN_US_PER_S = 250.0f;
+static const float LAND_TOUCHDOWN_TIMEOUT_S = 2.0f;
+static const float LAND_MOTOR_RAMP_S         = 1.0f;
 static const float TAKEOFF_NO_RISE_S        = 4.0f;
-static const float TAKEOFF_TIMEOUT_S        = 15.0f;
+static const float TAKEOFF_TIMEOUT_S        = 20.0f;
 static const float MAX_FLIGHT_S             = 60.0f;
-static const float LAND_TIMEOUT_S           = 12.0f;
+static const float LAND_TIMEOUT_S           = 24.0f;
 static const uint32_t ARMED_IDLE_TIMEOUT_MS = 15000UL;
 static const uint32_t RANGE_FRESH_MS        = 250;
 static const uint32_t RANGE_FAILSAFE_MS     = 800;
 static const uint32_t BARO_FRESH_MS         = 250;
+static const uint32_t ALT_COAST_MS           = 600;
 static const uint32_t BLIND_LAND_MS         = 8000;
+static const uint32_t ALTITUDE_SNAPSHOT_STALE_MS = 100;
+
+// -- Hop nhat MTF01P + BMP388 --
+// MTF chinh xac hon o 1 m; BMP chi them thanh phan cham va noi tiep khi MTF mat.
+static const uint8_t ALT_SOURCE_NONE         = 0;
+static const uint8_t ALT_SOURCE_MTF          = 1;
+static const uint8_t ALT_SOURCE_BARO         = 2;
+static const uint8_t ALT_SOURCE_FUSED        = 3;
+static const uint8_t ALT_SOURCE_COAST        = 4;
+static const uint8_t RANGE_VELOCITY_SAMPLES = 15;
+static const float RANGE_FILTER_TAU_S        = 0.10f;
+static const float RANGE_VELOCITY_TAU_S      = 0.20f;
+static const float FUSION_BARO_HEIGHT_WEIGHT = 0.10f;
+static const float FUSION_BARO_VEL_WEIGHT    = 0.30f;
+static const float FUSION_HEIGHT_TAU_MTF_S   = 0.12f;
+static const float FUSION_HEIGHT_TAU_BARO_S  = 0.45f;
+static const float FUSION_VELOCITY_TAU_S     = 0.18f;
+static const float BARO_ALIGN_TAU_S          = 8.0f;
+static const float BARO_INNOVATION_GATE_M    = 0.45f;
+
+// -- Giu vi tri ngang bang optical flow MTF01P --
+// Hai dong mapping nay PHAI duoc kiem tra bang cach day drone bang tay, khong canh.
+// Sau mapping: +forward = ve mui, +right = sang phai than drone.
+#define FLOW_SWAP_XY 0
+static const float FLOW_X_SIGN                    = +1.0f;
+static const float FLOW_Y_SIGN                    = +1.0f;
+static const uint8_t FLOW_GOOD_STATUS             = 0x01;
+static const uint8_t FLOW_MIN_QUALITY             = 40;
+static const uint32_t FLOW_MIN_HEIGHT_MM          = 50;
+static const uint32_t FLOW_FRESH_MS               = 250;
+static const float FLOW_FILTER_TAU_S              = 0.12f;
+static const float FLOW_REFERENCE_HEIGHT_M        = 1.0f;
+static const float FLOW_CM_S_TO_M_S               = 0.01f;
+static const float FLOW_DEADBAND_MPS              = 0.015f;
+static const float FLOW_ZERO_SIGMA_MULTIPLIER     = 3.0f;
+static const float FLOW_MAX_DEADBAND_MPS          = 0.12f;
+static const float FLOW_MAX_SPEED_MPS             = 3.0f;
+
+// Vong ngang lay error_m = 0 - position_m quanh moc calib; khong co "vung cho
+// phep" 50 cm. Toc do/gain o he SI nen khong phu thuoc ALT_TARGET_M.
+static const float POS_HOLD_FLOW_CONFIRM_S         = 0.20f;
+static const float POS_HOLD_KP_PER_S                = 0.40f;
+static const float POS_HOLD_MAX_VEL_MPS            = 0.35f;
+static const float POS_HOLD_VEL_KP_DEG_PER_MPS     = 3.0f;
+static const float POS_HOLD_VEL_KI_DEG_PER_M       = 0.3f;
+static const float POS_HOLD_I_LIMIT_DEG            = 1.5f;
+static const float POS_HOLD_MAX_TILT_DEG           = 3.5f;
+static const float POS_HOLD_TILT_SLEW_DEG_PER_S    = 8.0f;
+static const float POS_HOLD_MIN_ALT_M               = 0.10f;
+static const float POS_HOLD_ESTIMATE_LIMIT_M        = 2.0f;
+// Voi mixer hien tai: tang toc ve truoc can pitch am, sang phai can roll duong.
+static const float POS_HOLD_PITCH_SIGN             = -1.0f;
+static const float POS_HOLD_ROLL_SIGN              = +1.0f;
 
 // Trip theo SAI SO goc (muc tieu - thuc te) va phai keo dai, khong phai goc tuyet doi.
 static const float SAFE_ANGLE_ERR    = 45.0f;
@@ -171,10 +263,19 @@ static const float MIX_PITCH_SIGN = +1.0f;
 static const float MIX_ROLL_SIGN  = +1.0f;
 static const float MIX_YAW_SIGN   = +1.0f;
 
-// -- Trim --
+// -- Can bang tai / trim --
 static const int   TRIM_M1 = 0, TRIM_M2 = 0, TRIM_M3 = 0, TRIM_M4 = 0;
-static const float PITCH_TRIM_DEG = -0.57f;
-static const float ROLL_TRIM_DEG  = -0.16f;
+// Pin lech ve mui can them moment nang cap motor truoc. Gia tri duong trong
+// mixer nay tang M1/M2 va giam M3/M4. Bu ramp theo collective de khong lam cac
+// motor tach nhau dot ngot luc ARM/idle; day la feed-forward moment, khong phai
+// mot lenh nghieng than drone. Can xac nhan/tinh chinh tren gia thu co day giu.
+static const float CG_PITCH_COMP_US_AT_HOVER = +15.0f;
+static const float CG_ROLL_COMP_US_AT_HOVER  = 0.0f;
+static const float CG_COMP_MAX_US            = 30.0f;
+// Level target phai la 0 do. Dung angle trim de che CG lech se tu tao gia toc
+// ngang; moment tinh da duoc xu ly rieng boi CG_*_COMP o mixer.
+static const float PITCH_TRIM_DEG = 0.0f;
+static const float ROLL_TRIM_DEG  = 0.0f;
 static const float TRIM_DEG_MAX   = 5.0f;
 
 // -- Loc --
@@ -309,6 +410,19 @@ typedef enum : uint8_t {
   FS_TRIPPED
 } FlightMode;
 
+// Subphase noi bo; giu nguyen FlightMode de khong pha giao thuc/operator flow.
+typedef enum : uint8_t {
+  PHASE_NONE = 0,
+  PHASE_TAKEOFF_SPOOL_UP,
+  PHASE_TAKEOFF_GROUND_TRANSITION,
+  PHASE_TAKEOFF_CONTROLLED_ASCENT,
+  PHASE_TAKEOFF_ALTITUDE_CAPTURE,
+  PHASE_LAND_CONTROLLED_DESCENT,
+  PHASE_LAND_GROUND_APPROACH,
+  PHASE_LAND_TOUCHDOWN_DETECTION,
+  PHASE_LAND_MOTOR_RAMP_DOWN
+} TransitionPhase;
+
 typedef enum : uint8_t {
   CMD_HEARTBEAT = 0,
   CMD_ARM,
@@ -364,13 +478,33 @@ typedef struct __attribute__((packed)) {
   float    rangeAltitudeM, baroAltitudeM;
   int16_t  altitudeCorrectionUs;
   uint16_t rangeAgeMs, baroAgeMs;
-  uint8_t  altitudeSource;       // 0=none, 1=MTF01P, 2=BMP388
+  uint8_t  altitudeSource;       // 0=none, 1=MTF, 2=BMP, 3=fused, 4=coast
   uint8_t  rangeStrength;
   uint8_t  lastCommand;
-  uint8_t  reserved;
+  uint8_t  transitionPhase;
+
+  // Optical-flow da map vao truc than va vi tri tich phan tu moc calib.
+  float    flowForwardMps, flowRightMps;
+  float    positionForwardM, positionRightM;
+  float    positionPitchDeg, positionRollDeg;
+  uint16_t flowAgeMs;
+  uint8_t  flowQuality;
+  uint8_t  flowReserved;
+
+  // Telemetry v5: giu layout 248 byte cua v4, doi identity de ghep dung binary
+  // position-hold da chuan hoa; van do duoc timing/sensor thay vi
+  // suy doan tu ODR danh nghia. Don vi rate la 0.1Hz, duration la microsecond.
+  float    altitudeVelocitySetpointMps;
+  float    altitudeIntegralUs;
+  uint32_t configSignature;
+  uint16_t controlDtUs, controlDtMaxUs, controlOverruns;
+  uint16_t mtfRateHz10, mtfGapMaxUs;
+  uint16_t bmpRateHz10, bmpReadMaxUs, auxWaitMaxUs;
+  uint16_t altitudeGapMaxUs, uartBacklogMax;
+  uint16_t mtfBadCrc, mtfStale, bmpReadFail, auxLockMiss;
 } TelemPacket;
 
-static_assert(sizeof(TelemPacket) == 180, "TelemPacket doi kich thuoc - sua sender_1m.ino!");
+static_assert(sizeof(TelemPacket) == 248, "TelemPacket doi kich thuoc - sua sender_1m.ino!");
 static_assert(sizeof(TelemPacket) <= 250, "ESP-NOW toi da 250 byte/goi.");
 
 typedef struct {
@@ -382,15 +516,32 @@ typedef struct {
   uint32_t baroAgeMs;
   uint8_t source;
   uint8_t rangeStrength;
+  float flowForwardMps;
+  float flowRightMps;
+  uint32_t flowAgeMs;
+  uint8_t flowQuality;
   uint32_t publishedMs;
+  uint16_t mtfRateHz10;
+  uint16_t mtfGapMaxUs;
+  uint16_t bmpRateHz10;
+  uint16_t bmpReadMaxUs;
+  uint16_t auxWaitMaxUs;
+  uint16_t altitudeGapMaxUs;
+  uint16_t uartBacklogMax;
+  uint16_t mtfBadCrc;
+  uint16_t mtfStale;
+  uint16_t bmpReadFail;
+  uint16_t auxLockMiss;
   bool calibrated;
   bool rangeFresh;
   bool baroFresh;
+  bool flowFresh;
 } AltitudeSnapshot;
 
 void telemTask(void *arg);
 void espnowTask(void *arg);
 void altitudeTask(void *arg);
+static bool landingNearGround();
 
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
 void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len);
@@ -400,11 +551,14 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len);
 
 #if ENABLE_OLED
 typedef struct {
-  float       pitch, roll, yaw;
-  float       outP, outR, outY;
-  int         throttle, m1, m2, m3, m4;
-  uint16_t    loopHz;
-  FlightMode  mode;
+  // 5 dong flight data + 2 dong WHY/ACT de chan doan failsafe ngay tren OLED.
+  float altitudeM, altitudeSetpointM, verticalSpeedMps;
+  float flowForwardMps, flowRightMps;
+  float positionForwardM, positionRightM;
+  int throttle;
+  uint8_t altitudeSource, flowQuality;
+  FlightMode mode;
+  bool linkUp, flowFresh;
   const char *reason;
 } OledSnap;
 void oledTask(void *arg);
@@ -450,6 +604,7 @@ static uint32_t ctrlCount = 0;
 static uint16_t loopHz = 0;
 static int      sampleTick = 0, sensorFailCount = 0;
 static bool     loopOverrun = false;
+static uint32_t controlDtUs = 0, controlDtMaxUs = 0, controlOverrunCount = 0;
 
 static float    vibX = 0.0f, vibY = 0.0f, vibZ = 0.0f;
 static float    vibHoldX = 0.0f, vibHoldY = 0.0f, vibHoldZ = 0.0f;
@@ -464,7 +619,7 @@ static volatile uint32_t espnowLastMs = 0;
 static bool              espnowReady = false;
 static bool              linkUp = false, linkEverUp = false;
 static volatile uint8_t  pendingCommand = CMD_HEARTBEAT;
-static volatile uint16_t pendingTargetCm = 100;
+static volatile uint16_t pendingTargetCm = 50;
 static volatile uint16_t pendingHoverUs = HOVER_DEFAULT;
 static uint16_t          lastActionSequence = 0;
 static bool              haveActionSequence = false;
@@ -479,6 +634,8 @@ static uint32_t          armedIdleStartMs = 0;
 static bool  fsLanding = false;
 static uint32_t blindLandStartMs = 0;
 static int blindLandStartThrottle = HOVER_DEFAULT;
+static float altitudeThrottleSlewF = (float)HOVER_DEFAULT;
+static bool altitudeThrottleSlewLimited = false;
 
 // -- Cao do --
 static HardwareSerial MTFSerial(1);
@@ -489,17 +646,39 @@ static TaskHandle_t altitudeTaskH = NULL;
 static volatile uint32_t altitudeSeq = 0;
 static AltitudeSnapshot altitudeShared = {};
 static AltitudeSnapshot altitudeNow = {};
+static volatile uint32_t altitudeSnapshotReadFailCount = 0;
 static volatile float altitudeTiltCos = 1.0f;
 static bool bmpReady = false;
 static uint8_t bmpAddress = 0;
 static float altitudeSetpointM = 0.0f;
+static float altitudeVelocitySetpointMps = 0.0f;
 static float altitudeIntegral = 0.0f;
 static float altitudeCorrectionUs = 0.0f;
-static float takeoffElapsedS = 0.0f;
+static float takeoffThrottleF = (float)MOTOR_MIN_US;
+static float takeoffElapsedS = 0.0f, phaseElapsedS = 0.0f;
+static float liftoffConfirmS = 0.0f;
+static bool  takeoffLiftConfirmed = false, takeoffReachedClearance = false;
+static float takeoffGroundPitchDeg = 0.0f, takeoffGroundRollDeg = 0.0f;
+static float takeoffAttitudePitchSpDeg = 0.0f, takeoffAttitudeRollSpDeg = 0.0f;
+static float takeoffGroundUnsafeS = 0.0f, takeoffAttitudeTransferS = 0.0f;
+static bool  takeoffAttitudeProfileActive = false;
 static float holdConfirmS = 0.0f;
 static float landedConfirmS = 0.0f;
 static uint32_t flightStartMs = 0;
 static uint32_t landingStartMs = 0;
+static TransitionPhase transitionPhase = PHASE_NONE;
+static int landingRampStartThrottle = IDLE_THROTTLE;
+static int landingRampStartM1 = IDLE_THROTTLE, landingRampStartM2 = IDLE_THROTTLE;
+static int landingRampStartM3 = IDLE_THROTTLE, landingRampStartM4 = IDLE_THROTTLE;
+
+// -- Position hold: vi tri trong he truc ngang co dinh tai moc calib ban dau. --
+static float positionForwardM = 0.0f, positionRightM = 0.0f;
+static float positionIntegralForward = 0.0f, positionIntegralRight = 0.0f;
+static float positionPitchDeg = 0.0f, positionRollDeg = 0.0f;
+static float positionYawReferenceDeg = 0.0f;
+static float positionFlowConfirmS = 0.0f;
+static float positionFlowLostS = 0.0f;
+static bool  positionReferenceInitialized = false, positionHoldActive = false;
 
 // -- Telemetry --
 static volatile uint32_t telemSeq = 0;
@@ -573,7 +752,7 @@ static void pid_reset(PIDController *p) {
 // mixSat = mixer da cat lenh cua truc nay o chu ky truoc.
 static float pid_compute(PIDController *p, float setpoint, float meas, float dt, bool mixSat) {
   if (dt <= 0.0f) return 0.0f;
-  if (isnan(meas) || isinf(meas) || isnan(setpoint)) { pid_reset(p); return 0.0f; }
+  if (!isfinite(meas) || !isfinite(setpoint)) { pid_reset(p); return 0.0f; }
 
   float error  = setpoint - meas;
   float p_term = p->kp * error;
@@ -742,7 +921,7 @@ static void madgwick_update(Madgwick *m, float gx, float gy, float gz,
   q0 += qDot1 * dt; q1 += qDot2 * dt; q2 += qDot3 * dt; q3 += qDot4 * dt;
 
   float qnorm = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  if (qnorm < 1e-6f || isnan(qnorm)) { madgwick_init(m, m->beta, m->zeta); return; }
+  if (!isfinite(qnorm) || qnorm < 1e-6f) { madgwick_init(m, m->beta, m->zeta); return; }
   float r = 1.0f / qnorm;
   m->q0 = q0 * r; m->q1 = q1 * r; m->q2 = q2 * r; m->q3 = q3 * r;
 }
@@ -846,12 +1025,20 @@ static bool mpuInit() {
   delay(50);
 
   uint8_t rCfg = 0, rGyro = 0, rAcc = 0, rDiv = 0;
-  mpuRead(MPU_REG_CONFIG, &rCfg);       mpuRead(MPU_REG_GYRO_CONFIG, &rGyro);
-  mpuRead(MPU_REG_ACCEL_CONFIG, &rAcc); mpuRead(MPU_REG_SMPLRT_DIV, &rDiv);
+  const bool readbackOk = mpuRead(MPU_REG_CONFIG, &rCfg) &&
+                          mpuRead(MPU_REG_GYRO_CONFIG, &rGyro) &&
+                          mpuRead(MPU_REG_ACCEL_CONFIG, &rAcc) &&
+                          mpuRead(MPU_REG_SMPLRT_DIV, &rDiv);
+  if (!readbackOk) {
+    Serial.println("[MPU] LOI: khong doc lai duoc cau hinh!");
+    return false;
+  }
   Serial.printf("[MPU] WHO=0x%X DLPF=0x%X GYRO=0x%X ACCEL=0x%X DIV=0x%X\n",
                 who, rCfg, rGyro, rAcc, rDiv);
-  if (rCfg != 0x03 || rGyro != 0x08 || rAcc != 0x08 || rDiv != 0x00)
+  if (rCfg != 0x03 || rGyro != 0x08 || rAcc != 0x08 || rDiv != 0x00) {
     Serial.println("[MPU] LOI: cau hinh doc lai khac gia tri da ghi!");
+    return false;
+  }
   return true;
 }
 
@@ -884,11 +1071,13 @@ static bool calibrateImu() {
   Serial.println("[CAL] Dat drone nam ngang, giu yen...");
 #if ENABLE_OLED
   if (oledOK) {
+    if (auxI2cMutex) xSemaphoreTake(auxI2cMutex, portMAX_DELAY);
     display.clearDisplay(); display.setCursor(0, 0);
     display.println("HIEU CHUAN");
     display.println("DAT MAT PHANG NGANG");
     display.println("GIU YEN!");
     display.display();
+    if (auxI2cMutex) xSemaphoreGive(auxI2cMutex);
   }
 #endif
 
@@ -991,6 +1180,10 @@ static inline uint32_t readLe32(const uint8_t *p) {
          ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static inline int16_t readLe16s(const uint8_t *p) {
+  return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
 typedef struct {
   uint32_t sensorMs;
   uint32_t distanceMm;
@@ -998,6 +1191,10 @@ typedef struct {
   uint8_t sequence;
   uint8_t strength;
   uint8_t status;
+  int16_t flowVelX;
+  int16_t flowVelY;
+  uint8_t flowQuality;
+  uint8_t flowStatus;
 } MtfRangeFrame;
 
 class MtfParser {
@@ -1053,6 +1250,11 @@ public:
         out->sequence = seq;
         out->strength = payload[8];
         out->status = payload[10];
+        // Payload 0x51: flow signed tai byte 12..15, quality/status tai 16..17.
+        out->flowVelX = readLe16s(payload + 12);
+        out->flowVelY = readLe16s(payload + 14);
+        out->flowQuality = payload[16];
+        out->flowStatus = payload[17];
         good++;
         return true;
       }
@@ -1082,12 +1284,24 @@ class AltitudeEstimator {
   MtfParser parser;
   Median5 rangeMedian;
   float rangeEma = 0.0f, rangeVelocity = 0.0f, lastRangeMm = 0.0f;
-  float rangeHistory[6] = {};
-  uint32_t rangeTime[6] = {};
+  float rangeHistory[RANGE_VELOCITY_SAMPLES] = {};
+  uint32_t rangeTime[RANGE_VELOCITY_SAMPLES] = {};
   uint8_t rangeCount = 0, rangeNext = 0, stepCount = 0;
   float stepCandidateMm = 0.0f;
-  uint32_t lastRangeUs = 0, lastBmpAttemptMs = 0, lastBmpGoodMs = 0;
+  uint32_t lastRangeUs = 0, lastRangeSensorMs = 0;
+  uint32_t lastBmpAttemptMs = 0, lastBmpGoodMs = 0;
   uint32_t lastCalRangeUs = 0, lastCalBmpMs = 0;
+
+  // Flow duoc doi sang m/s theo height cua chinh sample truoc khi loc. Nhu vay
+  // state median/EMA cung mot don vi vat ly khi drone thay doi cao do.
+  Median5 flowMedianX, flowMedianY;
+  float flowEmaX = 0.0f, flowEmaY = 0.0f;
+  float flowBiasX = 0.0f, flowBiasY = 0.0f;
+  float flowNoiseX = 0.0f, flowNoiseY = 0.0f;
+  float flowForwardMps = 0.0f, flowRightMps = 0.0f;
+  uint32_t lastFlowUs = 0, lastFlowSensorMs = 0;
+  uint8_t flowQuality = 0;
+  bool flowValid = false, flowFilterInitialized = false;
 
   float pressurePa = 0.0f, pressureZeroPa = 0.0f;
   float baroEma = 0.0f, baroVelocity = 0.0f, baroOffset = 0.0f;
@@ -1095,29 +1309,80 @@ class AltitudeEstimator {
   uint32_t baroTime[12] = {};
   uint8_t baroCount = 0, baroNext = 0;
 
+  // Observer hop nhat: tich phan Vz de noi giua cac sample, sau do sua cham ve
+  // cao do do duoc. Nho vay mat/phuc hoi mot sensor khong tao buoc nhay output.
+  float fusedAltitude = 0.0f, fusedVelocity = 0.0f;
+  uint32_t lastFusionUs = 0, fusionRangeSeenUs = 0, fusionBaroSeenMs = 0;
+  uint32_t lastBaroAlignMs = 0;
+  uint8_t fusionSource = ALT_SOURCE_NONE;
+  bool fusionInitialized = false, baroAligned = false;
+
   uint32_t calStartMs = 0;
   double calRangeSum = 0.0, calRangeSq = 0.0, calPressureSum = 0.0;
   uint32_t calRangeN = 0, calPressureN = 0;
+  double calFlowSumX = 0.0, calFlowSumY = 0.0;
+  double calFlowSqX = 0.0, calFlowSqY = 0.0;
+  uint32_t calFlowN = 0;
   float groundRangeM = 0.0f;
   bool calibrated = false;
   uint8_t rangeStrength = 0;
 
-  float rangeVelocityFromHistory(float h, uint32_t nowUs) {
-    rangeHistory[rangeNext] = h; rangeTime[rangeNext] = nowUs;
-    rangeNext = (rangeNext + 1) % 6; if (rangeCount < 6) rangeCount++;
+  // Chan doan do task nay so huu (chi ghi tren core 0). Max/counter la
+  // monotonic de khong can reset cheo core; snapshot se saturate ve uint16_t.
+  uint32_t diagWindowStartMs = 0;
+  uint32_t diagMtfWindowFrames = 0, diagBmpWindowSamples = 0;
+  uint32_t diagLastMtfSensorMs = 0, diagLastPollUs = 0;
+  uint32_t diagMtfGapMaxUs = 0, diagBmpReadMaxUs = 0;
+  uint32_t diagAuxWaitMaxUs = 0, diagAltitudeGapMaxUs = 0;
+  uint32_t diagUartBacklogMax = 0, diagBmpReadFail = 0, diagAuxLockMiss = 0;
+  uint16_t diagMtfRateHz10 = 0, diagBmpRateHz10 = 0;
+
+  static uint16_t saturate16(uint32_t value) {
+    return value > 65535UL ? (uint16_t)65535 : (uint16_t)value;
+  }
+
+  void noteMtfFrame(uint32_t sensorMs) {
+    if (diagLastMtfSensorMs) {
+      const uint32_t gap = (sensorMs - diagLastMtfSensorMs) * 1000UL;
+      if (gap > diagMtfGapMaxUs) diagMtfGapMaxUs = gap;
+    }
+    diagLastMtfSensorMs = sensorMs;
+    diagMtfWindowFrames++;
+  }
+
+  void updateDiagnosticRates(uint32_t nowMs) {
+    if (!diagWindowStartMs) {
+      diagWindowStartMs = nowMs;
+      return;
+    }
+    const uint32_t elapsedMs = nowMs - diagWindowStartMs;
+    if (elapsedMs < 1000UL) return;
+    diagMtfRateHz10 = saturate16((diagMtfWindowFrames * 10000UL + elapsedMs / 2UL) /
+                                 elapsedMs);
+    diagBmpRateHz10 = saturate16((diagBmpWindowSamples * 10000UL + elapsedMs / 2UL) /
+                                 elapsedMs);
+    diagMtfWindowFrames = diagBmpWindowSamples = 0;
+    diagWindowStartMs = nowMs;
+  }
+
+  float rangeVelocityFromHistory(float h, uint32_t sampleMs) {
+    rangeHistory[rangeNext] = h; rangeTime[rangeNext] = sampleMs;
+    rangeNext = (rangeNext + 1) % RANGE_VELOCITY_SAMPLES;
+    if (rangeCount < RANGE_VELOCITY_SAMPLES) rangeCount++;
     if (rangeCount < 3) return 0.0f;
-    const uint8_t oldest = (rangeNext + 6 - rangeCount) % 6;
+    const uint8_t oldest = (rangeNext + RANGE_VELOCITY_SAMPLES - rangeCount) %
+                           RANGE_VELOCITY_SAMPLES;
     const uint32_t base = rangeTime[oldest];
     float mt = 0, mh = 0;
     for (uint8_t i = 0; i < rangeCount; i++) {
-      const uint8_t k = (oldest + i) % 6;
-      mt += (uint32_t)(rangeTime[k] - base) * 1e-6f; mh += rangeHistory[k];
+      const uint8_t k = (oldest + i) % RANGE_VELOCITY_SAMPLES;
+      mt += (uint32_t)(rangeTime[k] - base) * 1e-3f; mh += rangeHistory[k];
     }
     mt /= rangeCount; mh /= rangeCount;
     float n = 0, d = 0;
     for (uint8_t i = 0; i < rangeCount; i++) {
-      const uint8_t k = (oldest + i) % 6;
-      const float t = (uint32_t)(rangeTime[k] - base) * 1e-6f - mt;
+      const uint8_t k = (oldest + i) % RANGE_VELOCITY_SAMPLES;
+      const float t = (uint32_t)(rangeTime[k] - base) * 1e-3f - mt;
       n += t * (rangeHistory[k] - mh); d += t * t;
     }
     return d > 1e-8f ? n / d : 0.0f;
@@ -1126,9 +1391,12 @@ class AltitudeEstimator {
   bool acceptRange(const MtfRangeFrame &f, float tiltCos) {
     if (f.status != 0x01 || f.strength < 10 || f.distanceMm < 30 || f.distanceMm > 12000)
       return false;
-    const float dt = lastRangeUs ? (f.receivedUs - lastRangeUs) * 1e-6f : 0.01f;
-    if (lastRangeUs && dt > 0.25f) {
+    if (!isfinite(tiltCos)) return false;
+    const float dt = lastRangeSensorMs ? (uint32_t)(f.sensorMs - lastRangeSensorMs) * 1e-3f
+                                        : 0.01f;
+    if (lastRangeSensorMs && dt > 0.25f) {
       rangeMedian.reset(); rangeCount = rangeNext = 0; rangeEma = 0.0f; lastRangeMm = 0.0f;
+      rangeVelocity = 0.0f;
     }
     if (lastRangeMm > 0.0f) {
       const float current = (float)f.distanceMm;
@@ -1145,25 +1413,143 @@ class AltitudeEstimator {
     const float verticalM = f.distanceMm * 0.001f * constrain(tiltCos, 0.50f, 1.0f);
     const float med = rangeMedian.push(verticalM);
     if (rangeEma == 0.0f) rangeEma = med;
-    else rangeEma += (1.0f - expf(-constrain(dt, 0.001f, 0.25f) / 0.062f)) * (med - rangeEma);
-    const float rawVz = rangeVelocityFromHistory(rangeEma, f.receivedUs);
-    rangeVelocity += 0.25f * (constrain(rawVz, -3.0f, 3.0f) - rangeVelocity);
+    else rangeEma += (1.0f - expf(-constrain(dt, 0.001f, 0.25f) /
+                                  RANGE_FILTER_TAU_S)) * (med - rangeEma);
+    const float rawVz = rangeVelocityFromHistory(rangeEma, f.sensorMs);
+    const float velocityAlpha = 1.0f - expf(-constrain(dt, 0.001f, 0.25f) /
+                                            RANGE_VELOCITY_TAU_S);
+    rangeVelocity += velocityAlpha * (constrain(rawVz, -3.0f, 3.0f) - rangeVelocity);
     lastRangeUs = f.receivedUs;
+    lastRangeSensorMs = f.sensorMs;
     rangeStrength = f.strength;
     return true;
+  }
+
+  void acceptFlow(const MtfRangeFrame &f, bool rangeAccepted) {
+    const uint32_t elapsedMs = millis() - calStartMs;
+    flowQuality = f.flowQuality;
+    const bool diagnosticOk = rangeAccepted && f.flowStatus == FLOW_GOOD_STATUS &&
+                              f.flowQuality >= FLOW_MIN_QUALITY;
+
+    // Khi drone dung yen trong calibration, lay trung binh raw lam zero-bias.
+    if (!calibrated && diagnosticOk && elapsedMs >= 1000UL && elapsedMs < 4000UL) {
+      calFlowSumX += f.flowVelX;
+      calFlowSumY += f.flowVelY;
+      calFlowSqX += (double)f.flowVelX * f.flowVelX;
+      calFlowSqY += (double)f.flowVelY * f.flowVelY;
+      calFlowN++;
+    }
+
+    const bool usable = calibrated && diagnosticOk &&
+                        f.distanceMm >= FLOW_MIN_HEIGHT_MM;
+    if (!usable) {
+      flowValid = false;
+      flowForwardMps = flowRightMps = 0.0f;
+      return;
+    }
+
+    float dt = lastFlowSensorMs ? (float)(uint32_t)(f.sensorMs - lastFlowSensorMs) * 1e-3f
+                                : 0.01f;
+    if (!lastFlowSensorMs || dt <= 0.0f || dt > 0.25f) {
+      flowMedianX.reset(); flowMedianY.reset();
+      flowEmaX = flowEmaY = 0.0f;
+      flowFilterInitialized = false;
+      dt = 0.01f;
+    }
+
+    // MTF raw la cm/s tai FLOW_REFERENCE_HEIGHT_M. Scale bang vertical range
+    // dong bo cua frame, doi sang m/s, roi moi median/EMA. Loc sau chuan hoa
+    // tranh mang state raw cua cao do cu sang cao do moi.
+    const float heightM = rangeEma > 0.0f ? rangeEma :
+                          f.distanceMm * 0.001f * altitudeTiltCos;
+    const float velocityScale = (heightM / FLOW_REFERENCE_HEIGHT_M) *
+                                FLOW_CM_S_TO_M_S;
+    const float sampleXMps = ((float)f.flowVelX - flowBiasX) * velocityScale * FLOW_X_SIGN;
+    const float sampleYMps = ((float)f.flowVelY - flowBiasY) * velocityScale * FLOW_Y_SIGN;
+    const float medX = flowMedianX.push(sampleXMps);
+    const float medY = flowMedianY.push(sampleYMps);
+    const float alpha = 1.0f - expf(-constrain(dt, 0.001f, 0.25f) / FLOW_FILTER_TAU_S);
+    if (!flowFilterInitialized) {
+      flowEmaX = medX; flowEmaY = medY;
+      flowFilterInitialized = true;
+    } else {
+      flowEmaX += alpha * (medX - flowEmaX);
+      flowEmaY += alpha * (medY - flowEmaY);
+    }
+
+    const float deadbandX = fminf(FLOW_MAX_DEADBAND_MPS,
+      fmaxf(FLOW_DEADBAND_MPS,
+            FLOW_ZERO_SIGMA_MULTIPLIER * flowNoiseX * velocityScale));
+    const float deadbandY = fminf(FLOW_MAX_DEADBAND_MPS,
+      fmaxf(FLOW_DEADBAND_MPS,
+            FLOW_ZERO_SIGMA_MULTIPLIER * flowNoiseY * velocityScale));
+    float xMps = fabsf(flowEmaX) < deadbandX ? 0.0f : flowEmaX;
+    float yMps = fabsf(flowEmaY) < deadbandY ? 0.0f : flowEmaY;
+
+#if FLOW_SWAP_XY
+    const float forwardMps = yMps;
+    const float rightMps = xMps;
+#else
+    const float forwardMps = xMps;
+    const float rightMps = yMps;
+#endif
+    if (!isfinite(forwardMps) || !isfinite(rightMps) ||
+        fabsf(forwardMps) > FLOW_MAX_SPEED_MPS || fabsf(rightMps) > FLOW_MAX_SPEED_MPS) {
+      flowValid = false;
+      flowForwardMps = flowRightMps = 0.0f;
+      return;
+    }
+    flowForwardMps = forwardMps;
+    flowRightMps = rightMps;
+    flowQuality = f.flowQuality;
+    lastFlowUs = f.receivedUs;
+    lastFlowSensorMs = f.sensorMs;
+    flowValid = true;
+  }
+
+  void drainMtfFrames() {
+    const int backlog = MTFSerial.available();
+    if (backlog > 0 && (uint32_t)backlog > diagUartBacklogMax)
+      diagUartBacklogMax = (uint32_t)backlog;
+    while (MTFSerial.available()) {
+      MtfRangeFrame f;
+      const uint32_t byteReadUs = micros();
+      if (parser.push((uint8_t)MTFSerial.read(), byteReadUs, &f)) {
+        noteMtfFrame(f.sensorMs);
+        const bool rangeAccepted = acceptRange(f, altitudeTiltCos);
+        acceptFlow(f, rangeAccepted);
+      }
+    }
   }
 
   void updateBmp(uint32_t nowMs) {
     if (!bmpReady || (uint32_t)(nowMs - lastBmpAttemptMs) < 22UL) return;
     lastBmpAttemptMs = nowMs;
-    bool ok;
-    if (auxI2cMutex) xSemaphoreTake(auxI2cMutex, portMAX_DELAY);
-    ok = bmp.performReading();
-    if (auxI2cMutex) xSemaphoreGive(auxI2cMutex);
-    if (!ok || !isfinite(bmp.pressure) || bmp.pressure < 30000.0f || bmp.pressure > 110000.0f)
+    const uint32_t waitStartUs = micros();
+    bool haveBus = true;
+    if (auxI2cMutex)
+      haveBus = xSemaphoreTake(auxI2cMutex, pdMS_TO_TICKS(AUX_MUTEX_WAIT_MS)) == pdTRUE;
+    const uint32_t waitUs = micros() - waitStartUs;
+    if (waitUs > diagAuxWaitMaxUs) diagAuxWaitMaxUs = waitUs;
+    if (!haveBus) {
+      diagAuxLockMiss++;
       return;
+    }
+
+    const uint32_t readStartUs = micros();
+    const bool ok = bmp.performReading();
+    const uint32_t readUs = micros() - readStartUs;
+    if (readUs > diagBmpReadMaxUs) diagBmpReadMaxUs = readUs;
+    if (auxI2cMutex) xSemaphoreGive(auxI2cMutex);
+    if (!ok || !isfinite(bmp.pressure) || bmp.pressure < 30000.0f || bmp.pressure > 110000.0f) {
+      diagBmpReadFail++;
+      return;
+    }
     pressurePa = bmp.pressure;
-    lastBmpGoodMs = nowMs;
+    // Day la moc hoan tat read tren host, khong tu nhan la sample-time vat ly.
+    lastBmpGoodMs = millis();
+    nowMs = lastBmpGoodMs;
+    diagBmpWindowSamples++;
     if (!calibrated || pressureZeroPa <= 0.0f) return;
     const float rawAlt = 44330.0f * (1.0f - powf(pressurePa / pressureZeroPa, 0.19029495f));
     if (!isfinite(rawAlt)) return;
@@ -1182,20 +1568,139 @@ class AltitudeEstimator {
     }
   }
 
+  void updateFusion(uint32_t nowMs, uint32_t rangeAge, uint32_t baroAge,
+                    bool rangeFresh, bool baroFresh, float rangeAltitude) {
+    const uint32_t nowUs = micros();
+    const bool newRange = lastRangeUs && lastRangeUs != fusionRangeSeenUs;
+    const bool newBaro = lastBmpGoodMs && lastBmpGoodMs != fusionBaroSeenMs;
+
+    // Can BMP vao MTF mot lan khi bat dau, sau do chi hoc drift rat cham va chi
+    // tren sample moi. Ban cu hoc 1% moi 1 ms nen BMP duoi theo noise MTF trong
+    // khoang 0.1 s va khong con la nguon doc lap.
+    if (rangeFresh && baroFresh) {
+      if (!baroAligned) {
+        baroOffset = rangeAltitude - baroEma;
+        baroAligned = true;
+        lastBaroAlignMs = nowMs;
+      } else if (newRange || newBaro) {
+        const float alignDt = lastBaroAlignMs
+          ? constrain((uint32_t)(nowMs - lastBaroAlignMs) * 0.001f, 0.001f, 0.25f)
+          : 0.02f;
+        lastBaroAlignMs = nowMs;
+        const float innovation = rangeAltitude - (baroEma + baroOffset);
+        if (fabsf(innovation) <= BARO_INNOVATION_GATE_M) {
+          const float alpha = 1.0f - expf(-alignDt / BARO_ALIGN_TAU_S);
+          baroOffset += alpha * innovation;
+        }
+      }
+    } else if (baroFresh && !baroAligned) {
+      // P0 da duoc lay luc dat yen, nen 0 la fallback hop ly neu MTF chua san sang.
+      baroOffset = 0.0f;
+      baroAligned = true;
+    }
+
+    const float alignedBaro = baroEma + baroOffset;
+    const bool sensorsAgree = rangeFresh && baroFresh &&
+                              fabsf(rangeAltitude - alignedBaro) <= BARO_INNOVATION_GATE_M;
+    const uint32_t freshestAge = rangeAge < baroAge ? rangeAge : baroAge;
+    const bool coast = !rangeFresh && !baroFresh && fusionInitialized &&
+                       freshestAge <= ALT_COAST_MS;
+
+    float measuredAltitude = fusedAltitude;
+    float measuredVelocity = 0.0f;
+    bool haveMeasurement = false;
+    if (sensorsAgree) {
+      measuredAltitude = (1.0f - FUSION_BARO_HEIGHT_WEIGHT) * rangeAltitude +
+                         FUSION_BARO_HEIGHT_WEIGHT * alignedBaro;
+      measuredVelocity = (1.0f - FUSION_BARO_VEL_WEIGHT) * rangeVelocity +
+                         FUSION_BARO_VEL_WEIGHT * baroVelocity;
+      fusionSource = ALT_SOURCE_FUSED;
+      haveMeasurement = true;
+    } else if (rangeFresh) {
+      measuredAltitude = rangeAltitude;
+      measuredVelocity = rangeVelocity;
+      fusionSource = ALT_SOURCE_MTF;
+      haveMeasurement = true;
+    } else if (baroFresh) {
+      measuredAltitude = alignedBaro;
+      measuredVelocity = baroVelocity;
+      fusionSource = ALT_SOURCE_BARO;
+      haveMeasurement = true;
+    } else {
+      fusionSource = coast ? ALT_SOURCE_COAST : ALT_SOURCE_NONE;
+    }
+
+    float dt = lastFusionUs ? (float)(uint32_t)(nowUs - lastFusionUs) * 1e-6f : 0.001f;
+    dt = constrain(dt, 0.0005f, 0.05f);
+    lastFusionUs = nowUs;
+
+    if (!fusionInitialized && haveMeasurement) {
+      fusedAltitude = measuredAltitude;
+      fusedVelocity = constrain(measuredVelocity, -2.0f, 2.0f);
+      fusionInitialized = true;
+    } else if (fusionInitialized) {
+      if (haveMeasurement) {
+        const float velocityTarget = constrain(measuredVelocity, -2.0f, 2.0f);
+        const float velocityAlpha = 1.0f - expf(-dt / FUSION_VELOCITY_TAU_S);
+        fusedVelocity += velocityAlpha * (velocityTarget - fusedVelocity);
+
+        const float prediction = fusedAltitude + fusedVelocity * dt;
+        const float heightTau = rangeFresh ? FUSION_HEIGHT_TAU_MTF_S :
+                                             FUSION_HEIGHT_TAU_BARO_S;
+        const float heightAlpha = 1.0f - expf(-dt / heightTau);
+        fusedAltitude = prediction + heightAlpha * (measuredAltitude - prediction);
+      } else if (coast) {
+        fusedAltitude += fusedVelocity * dt;
+        fusedVelocity *= expf(-dt / 0.35f);
+      } else {
+        fusedVelocity = 0.0f;
+      }
+      fusedAltitude = constrain(fusedAltitude, -0.30f, 12.0f);
+    }
+
+    // Invariant cuoi truoc khi publish: loi noi bo/so hoc khong duoc bien
+    // thanh mot altitude hop le tren core dieu khien.
+    if (!isfinite(fusedAltitude) || !isfinite(fusedVelocity)) {
+      fusedAltitude = fusedVelocity = 0.0f;
+      fusionSource = ALT_SOURCE_NONE;
+      fusionInitialized = false;
+      baroAligned = false;
+    }
+
+    if (newRange) fusionRangeSeenUs = lastRangeUs;
+    if (newBaro) fusionBaroSeenMs = lastBmpGoodMs;
+  }
+
 public:
   void beginCalibration() {
     calStartMs = millis(); calRangeSum = calRangeSq = calPressureSum = 0.0;
     calRangeN = calPressureN = 0; calibrated = false;
+    calFlowSumX = calFlowSumY = calFlowSqX = calFlowSqY = 0.0; calFlowN = 0;
+    flowBiasX = flowBiasY = flowNoiseX = flowNoiseY = 0.0f;
+    flowMedianX.reset(); flowMedianY.reset();
+    flowEmaX = flowEmaY = 0.0f; flowValid = flowFilterInitialized = false;
+    lastFlowUs = lastFlowSensorMs = 0;
+    fusedAltitude = fusedVelocity = 0.0f;
+    lastFusionUs = fusionRangeSeenUs = fusionBaroSeenMs = lastBaroAlignMs = 0;
+    fusionSource = ALT_SOURCE_NONE;
+    fusionInitialized = baroAligned = false;
     lastCalRangeUs = lastCalBmpMs = 0;
   }
 
   void poll(uint32_t nowMs) {
-    while (MTFSerial.available()) {
-      MtfRangeFrame f;
-      const uint32_t nowUs = micros();
-      if (parser.push((uint8_t)MTFSerial.read(), nowUs, &f)) acceptRange(f, altitudeTiltCos);
+    const uint32_t pollUs = micros();
+    if (diagLastPollUs) {
+      const uint32_t gap = pollUs - diagLastPollUs;
+      if (gap > diagAltitudeGapMaxUs) diagAltitudeGapMaxUs = gap;
     }
+    diagLastPollUs = pollUs;
+
+    drainMtfFrames();
     updateBmp(nowMs);
+    // BMP/I2C co the chan; xa UART lan nua truoc fusion/publication.
+    drainMtfFrames();
+    nowMs = millis();
+    updateDiagnosticRates(nowMs);
 
     if (!calibrated) {
       const uint32_t elapsed = nowMs - calStartMs;
@@ -1215,6 +1720,22 @@ public:
           if (sqrtf(variance) <= 0.03f) {
             groundRangeM = mean;
             pressureZeroPa = (float)(calPressureSum / calPressureN);
+            if (calFlowN >= 50) {
+              flowBiasX = (float)(calFlowSumX / calFlowN);
+              flowBiasY = (float)(calFlowSumY / calFlowN);
+              const float varianceX = fmaxf(0.0f,
+                (float)(calFlowSqX / calFlowN) - flowBiasX * flowBiasX);
+              const float varianceY = fmaxf(0.0f,
+                (float)(calFlowSqY / calFlowN) - flowBiasY * flowBiasY);
+              flowNoiseX = sqrtf(varianceX);
+              flowNoiseY = sqrtf(varianceY);
+              Serial.printf("[FLOW] zero X=%+.2f Y=%+.2f sigma=%.2f/%.2f (%lu mau)\n",
+                            flowBiasX, flowBiasY, flowNoiseX, flowNoiseY,
+                            (unsigned long)calFlowN);
+            } else {
+              Serial.printf("[FLOW] CANH BAO: chi %lu mau zero; dung bias 0.\n",
+                            (unsigned long)calFlowN);
+            }
             calibrated = true; baroEma = baroVelocity = baroOffset = 0.0f;
             baroCount = baroNext = 0;
             Serial.printf("[ALT] CAL OK ground=%.3fm P0=%.2fPa\n", groundRangeM, pressureZeroPa);
@@ -1227,18 +1748,39 @@ public:
 
     const uint32_t rangeAge = lastRangeUs ? (uint32_t)(micros() - lastRangeUs) / 1000UL : UINT32_MAX;
     const uint32_t baroAge = lastBmpGoodMs ? nowMs - lastBmpGoodMs : UINT32_MAX;
+    const uint32_t flowAge = lastFlowUs ? (uint32_t)(micros() - lastFlowUs) / 1000UL : UINT32_MAX;
     const bool rangeFresh = calibrated && rangeAge <= RANGE_FRESH_MS;
     const bool baroFresh = calibrated && baroAge <= BARO_FRESH_MS && pressurePa > 0.0f;
-    const float rangeAlt = rangeEma - groundRangeM;
-    if (rangeFresh && baroFresh) baroOffset += 0.01f * (rangeAlt - (baroEma + baroOffset));
+    const bool flowFresh = calibrated && flowValid && flowAge <= FLOW_FRESH_MS;
+    // rangeEma van la khoang cach sensor-ground de scale flow. Cao do dieu khien
+    // la clearance cua than drone sau khi tru dung offset lap MTF 12 cm.
+    const float rangeAlt = rangeEma - MTF_SENSOR_TO_DRONE_BOTTOM_M;
+    if (calibrated)
+      updateFusion(nowMs, rangeAge, baroAge, rangeFresh, baroFresh, rangeAlt);
 
     AltitudeSnapshot s = {};
     s.calibrated = calibrated; s.rangeFresh = rangeFresh; s.baroFresh = baroFresh;
     s.publishedMs = nowMs;
     s.rangeAltitudeM = rangeAlt; s.baroAltitudeM = baroEma + baroOffset;
     s.rangeAgeMs = rangeAge; s.baroAgeMs = baroAge; s.rangeStrength = rangeStrength;
-    if (rangeFresh) { s.altitudeM = rangeAlt; s.verticalSpeedMps = rangeVelocity; s.source = 1; }
-    else if (baroFresh) { s.altitudeM = s.baroAltitudeM; s.verticalSpeedMps = baroVelocity; s.source = 2; }
+    s.flowForwardMps = flowForwardMps; s.flowRightMps = flowRightMps;
+    s.flowAgeMs = flowAge; s.flowQuality = flowQuality; s.flowFresh = flowFresh;
+    s.mtfRateHz10 = diagMtfRateHz10;
+    s.mtfGapMaxUs = saturate16(diagMtfGapMaxUs);
+    s.bmpRateHz10 = diagBmpRateHz10;
+    s.bmpReadMaxUs = saturate16(diagBmpReadMaxUs);
+    s.auxWaitMaxUs = saturate16(diagAuxWaitMaxUs);
+    s.altitudeGapMaxUs = saturate16(diagAltitudeGapMaxUs);
+    s.uartBacklogMax = saturate16(diagUartBacklogMax);
+    s.mtfBadCrc = saturate16(parser.badCrc);
+    s.mtfStale = saturate16(parser.stale);
+    s.bmpReadFail = saturate16(diagBmpReadFail);
+    s.auxLockMiss = saturate16(diagAuxLockMiss);
+    if (fusionInitialized && fusionSource != ALT_SOURCE_NONE) {
+      s.altitudeM = fusedAltitude;
+      s.verticalSpeedMps = fusedVelocity;
+      s.source = fusionSource;
+    }
 
     altitudeSeq = altitudeSeq + 1; __sync_synchronize();
     altitudeShared = s;
@@ -1251,14 +1793,46 @@ static AltitudeEstimator altitudeEstimator;
 static bool altitudeRead(AltitudeSnapshot *out) {
   for (uint8_t tries = 0; tries < 4; tries++) {
     const uint32_t s = altitudeSeq; if (s & 1U) continue;
-    __sync_synchronize(); *out = altitudeShared; __sync_synchronize();
-    if (altitudeSeq == s) return true;
+    AltitudeSnapshot candidate;
+    __sync_synchronize(); candidate = altitudeShared; __sync_synchronize();
+    if (altitudeSeq == s) { *out = candidate; return true; }
   }
   return false;
 }
 
+static bool sanitizeAltitudeSnapshot(AltitudeSnapshot *s) {
+  bool valid = true;
+  if (!isfinite(s->rangeAltitudeM)) {
+    s->rangeAltitudeM = 0.0f;
+    s->rangeFresh = false; s->rangeAgeMs = UINT32_MAX;
+    valid = false;
+  }
+  if (!isfinite(s->baroAltitudeM)) {
+    s->baroAltitudeM = 0.0f;
+    s->baroFresh = false; s->baroAgeMs = UINT32_MAX;
+    valid = false;
+  }
+  if (!isfinite(s->flowForwardMps) || !isfinite(s->flowRightMps)) {
+    s->flowForwardMps = s->flowRightMps = 0.0f;
+    s->flowFresh = false; s->flowAgeMs = UINT32_MAX;
+    valid = false;
+  }
+  if (s->source > ALT_SOURCE_COAST || !isfinite(s->altitudeM) ||
+      !isfinite(s->verticalSpeedMps) || s->altitudeM < -0.30f ||
+      s->altitudeM > 12.0f) {
+    s->altitudeM = s->verticalSpeedMps = 0.0f;
+    s->source = ALT_SOURCE_NONE;
+    s->rangeFresh = s->baroFresh = s->flowFresh = false;
+    s->rangeAgeMs = s->baroAgeMs = s->flowAgeMs = UINT32_MAX;
+    valid = false;
+  }
+  return valid;
+}
+
 void altitudeTask(void *arg) {
   (void)arg;
+  Serial.printf("[SCHED] altitude core=%d prio=%u\n", xPortGetCoreID(),
+                (unsigned)uxTaskPriorityGet(NULL));
   altitudeEstimator.beginCalibration();
   for (;;) { altitudeEstimator.poll(millis()); vTaskDelay(pdMS_TO_TICKS(1)); }
 }
@@ -1364,6 +1938,24 @@ static inline int throttleBandFor(int hover) {
   return b;
 }
 
+// Moment feed-forward do CG lech phai tang dan cung luc nang. O MOTOR_MIN,
+// compensation bang 0 de bon ESC khoi dong deu; tai hover no dat gia tri cau
+// hinh. Khong extrapolate qua hover va luon kep boi hard safety bound.
+static float cgCompensationScale(float throttle) {
+  const float span = fmaxf(1.0f, (float)HOVER_THROTTLE - (float)MOTOR_MIN_US);
+  return constrain((throttle - (float)MOTOR_MIN_US) / span, 0.0f, 1.0f);
+}
+
+static float cgPitchCompensation(float throttle) {
+  return constrain(CG_PITCH_COMP_US_AT_HOVER, -CG_COMP_MAX_US, CG_COMP_MAX_US) *
+         cgCompensationScale(throttle);
+}
+
+static float cgRollCompensation(float throttle) {
+  return constrain(CG_ROLL_COMP_US_AT_HOVER, -CG_COMP_MAX_US, CG_COMP_MAX_US) *
+         cgCompensationScale(throttle);
+}
+
 static void motor_mix(float throttle, float p_ctrl, float r_ctrl, float y_ctrl,
                       int *m1, int *m2, int *m3, int *m4) {
   // Altitude controller phai co quyen ha base toi MOTOR_MIN_US de LAND.
@@ -1419,6 +2011,41 @@ static void motor_mix(float throttle, float p_ctrl, float r_ctrl, float y_ctrl,
   *m4 = constrain((int)lroundf(base + f4) + TRIM_M4, minT, maxT);
 }
 
+// Mixer rieng cho khung con bi san rang buoc: khong day base len de cuu motor
+// phia thap, va khong motor nao vuot base takeoff + delta. Hy sinh authority
+// tren san de tranh mot goc drone spool nhanh hon ramp collective.
+static void motorMixGroundLimited(float throttle, float p_ctrl, float r_ctrl, float y_ctrl,
+                                  int *m1, int *m2, int *m3, int *m4) {
+  const int minT = MOTOR_MIN_US;
+  const int normalMaxT = min(ESC_MAX_US, HOVER_THROTTLE + throttleBand);
+  const int top = constrain((int)lroundf(throttle + TAKEOFF_GROUND_MOTOR_DELTA_US),
+                            minT, normalMaxT);
+
+  float f1 = +p_ctrl + r_ctrl + y_ctrl;
+  float f2 = +p_ctrl - r_ctrl - y_ctrl;
+  float f3 = -p_ctrl - r_ctrl + y_ctrl;
+  float f4 = -p_ctrl + r_ctrl - y_ctrl;
+  const float peak = fmaxf(fmaxf(fabsf(f1), fabsf(f2)),
+                           fmaxf(fabsf(f3), fabsf(f4)));
+  const float scale = peak > TAKEOFF_GROUND_MOTOR_DELTA_US
+                    ? TAKEOFF_GROUND_MOTOR_DELTA_US / peak : 1.0f;
+  f1 *= scale; f2 *= scale; f3 *= scale; f4 *= scale;
+
+  const int r1 = (int)lroundf(throttle + f1) + TRIM_M1;
+  const int r2 = (int)lroundf(throttle + f2) + TRIM_M2;
+  const int r3 = (int)lroundf(throttle + f3) + TRIM_M3;
+  const int r4 = (int)lroundf(throttle + f4) + TRIM_M4;
+  *m1 = constrain(r1, minT, top); *m2 = constrain(r2, minT, top);
+  *m3 = constrain(r3, minT, top); *m4 = constrain(r4, minT, top);
+
+  const bool clipped = scale < 0.999f || r1 < minT || r1 > top ||
+                       r2 < minT || r2 > top || r3 < minT || r3 > top ||
+                       r4 < minT || r4 > top;
+  mixLimit.roll = mixLimit.pitch = mixLimit.yaw = clipped;
+  mixLimit.thr_lo = r1 < minT || r2 < minT || r3 < minT || r4 < minT;
+  mixLimit.thr_hi = r1 > top || r2 > top || r3 > top || r4 > top;
+}
+
 // Bu ga theo goc nghieng: thanh phan thang dung cua luc day giam theo cos(tilt).
 static inline float angleBoost(float thr_us) {
 #if ANGLE_BOOST_ON
@@ -1432,17 +2059,60 @@ static inline float angleBoost(float thr_us) {
 #endif
 }
 
+// Handover per-motor tu mixer ground (khong angle boost) sang mixer airborne.
+// Alpha=0 trung dung output ground; alpha=1 trung dung output normal.
+static void motorMixTakeoffTransfer(float throttle, float p_ctrl, float r_ctrl, float y_ctrl,
+                                    float alpha, int *m1, int *m2, int *m3, int *m4) {
+  int g1, g2, g3, g4, n1, n2, n3, n4;
+  motorMixGroundLimited(throttle, p_ctrl, r_ctrl, y_ctrl, &g1, &g2, &g3, &g4);
+  const MixLimits groundLimits = mixLimit;
+  motor_mix(angleBoost(throttle), p_ctrl, r_ctrl, y_ctrl, &n1, &n2, &n3, &n4);
+  const MixLimits normalLimits = mixLimit;
+  alpha = constrain(alpha, 0.0f, 1.0f);
+  *m1 = (int)lroundf((float)g1 + ((float)n1 - (float)g1) * alpha);
+  *m2 = (int)lroundf((float)g2 + ((float)n2 - (float)g2) * alpha);
+  *m3 = (int)lroundf((float)g3 + ((float)n3 - (float)g3) * alpha);
+  *m4 = (int)lroundf((float)g4 + ((float)n4 - (float)g4) * alpha);
+  mixLimit.roll = groundLimits.roll || normalLimits.roll;
+  mixLimit.pitch = groundLimits.pitch || normalLimits.pitch;
+  mixLimit.yaw = groundLimits.yaw || normalLimits.yaw;
+  mixLimit.thr_lo = groundLimits.thr_lo || normalLimits.thr_lo;
+  mixLimit.thr_hi = groundLimits.thr_hi || normalLimits.thr_hi;
+}
+
 // ============================================================================
 // 12. AN TOAN, ARM, FAILSAFE
 // ============================================================================
+
+// Reset controller demand only. The position estimate remains relative to the
+// post-calibration origin for the whole powered session.
+static void resetHorizontalController() {
+  positionIntegralForward = positionIntegralRight = 0.0f;
+  positionPitchDeg = positionRollDeg = 0.0f;
+  positionFlowConfirmS = 0.0f;
+  positionFlowLostS = 0.0f;
+  positionHoldActive = false;
+  pitchSetpoint = constrain(PITCH_TRIM_DEG, -TRIM_DEG_MAX, TRIM_DEG_MAX);
+  rollSetpoint = constrain(ROLL_TRIM_DEG, -TRIM_DEG_MAX, TRIM_DEG_MAX);
+}
+
+static void resetHorizontalReference() {
+  positionForwardM = positionRightM = 0.0f;
+  positionYawReferenceDeg = yawHeading;
+  positionReferenceInitialized = false;
+  resetHorizontalController();
+}
 
 static void resetControllers() {
   cascaded_reset(&pitchAxis);
   cascaded_reset(&rollAxis);
   pid_reset(&yawRatePid);
   yawHold = yawHeading;
+  altitudeVelocitySetpointMps = 0.0f;
   altitudeIntegral = 0.0f;
   altitudeCorrectionUs = 0.0f;
+  altitudeThrottleSlewLimited = false;
+  resetHorizontalController();
 }
 
 static bool airborne() {
@@ -1450,9 +2120,52 @@ static bool airborne() {
          mode == FS_LANDING || mode == FS_FAILSAFE;
 }
 
+static const char *transitionPhaseName(TransitionPhase phase) {
+  switch (phase) {
+    case PHASE_TAKEOFF_SPOOL_UP:           return "SPOOL_UP";
+    case PHASE_TAKEOFF_GROUND_TRANSITION:  return "GROUND_TRANSITION";
+    case PHASE_TAKEOFF_CONTROLLED_ASCENT:  return "CONTROLLED_ASCENT";
+    case PHASE_TAKEOFF_ALTITUDE_CAPTURE:   return "ALTITUDE_CAPTURE";
+    case PHASE_LAND_CONTROLLED_DESCENT:    return "CONTROLLED_DESCENT";
+    case PHASE_LAND_GROUND_APPROACH:       return "GROUND_APPROACH";
+    case PHASE_LAND_TOUCHDOWN_DETECTION:   return "TOUCHDOWN_DETECTION";
+    case PHASE_LAND_MOTOR_RAMP_DOWN:       return "MOTOR_RAMP_DOWN";
+    default:                               return "NONE";
+  }
+}
+
+static void setTransitionPhase(TransitionPhase next) {
+  if (transitionPhase == next) return;
+  transitionPhase = next;
+  phaseElapsedS = 0.0f;
+  Serial.printf("[PHASE] %s\n", transitionPhaseName(next));
+}
+
+static void captureLandingRampStart() {
+  landingRampStartThrottle = throttleCmd;
+  landingRampStartM1 = curM1; landingRampStartM2 = curM2;
+  landingRampStartM3 = curM3; landingRampStartM4 = curM4;
+}
+
+static void beginTouchdownDetection() {
+  if (transitionPhase == PHASE_LAND_TOUCHDOWN_DETECTION ||
+      transitionPhase == PHASE_LAND_MOTOR_RAMP_DOWN) return;
+  captureLandingRampStart();
+  landedConfirmS = 0.0f;
+  setTransitionPhase(PHASE_LAND_TOUCHDOWN_DETECTION);
+}
+
+static void beginLandingMotorRamp() {
+  if (transitionPhase == PHASE_LAND_MOTOR_RAMP_DOWN) return;
+  captureLandingRampStart();
+  setTransitionPhase(PHASE_LAND_MOTOR_RAMP_DOWN);
+}
+
 static void tripSafety(const char *reason) {
   if (mode == FS_TRIPPED) return;
   mode        = FS_TRIPPED;
+  transitionPhase = PHASE_NONE;
+  takeoffAttitudeProfileActive = false;
   modeReason  = reason;
   tripRampT   = 0.0f;
   tripStartM1 = curM1; tripStartM2 = curM2;
@@ -1468,10 +2181,29 @@ static bool armConditionsMet() {
   if (!altitudeNow.calibrated)     { modeReason = "cao do chua CAL";     return false; }
   if (!altitudeNow.rangeFresh)     { modeReason = "MTF01P khong san sang"; return false; }
   if (!altitudeNow.baroFresh)      { modeReason = "BMP388 khong san sang"; return false; }
+  if (!altitudeNow.flowFresh)      { modeReason = "flow khong san sang"; return false; }
+  if (!positionReferenceInitialized) {
+    modeReason = "moc vi tri chua san sang"; return false;
+  }
+  if (!isfinite(positionForwardM) || !isfinite(positionRightM)) {
+    modeReason = "vi tri khong huu han"; return false;
+  }
+  if (!isfinite(altitudeNow.altitudeM) ||
+      !isfinite(altitudeNow.rangeAltitudeM) ||
+      !isfinite(altitudeNow.baroAltitudeM)) {
+    modeReason = "cao do khong huu han"; return false;
+  }
   if (fabsf(altitudeNow.altitudeM) > 0.12f) {
     modeReason = "cao do dat chua ve 0"; return false;
   }
-  if (isnan(pitch) || isnan(roll)) { modeReason = "goc NaN";             return false; }
+  if (!isfinite(pitch) || !isfinite(roll) || !isfinite(pitchRate) ||
+      !isfinite(rollRate) || !isfinite(yawRate) || !isfinite(yawHeading)) {
+    modeReason = "attitude khong huu han"; return false;
+  }
+  if (!isfinite(pitchOffset) || !isfinite(rollOffset) ||
+      !isfinite(vibHoldX) || !isfinite(vibHoldY) || !isfinite(vibHoldZ)) {
+    modeReason = "pre-arm khong huu han"; return false;
+  }
   if (fabsf(pitchOffset) > LEVEL_OFFSET_MAX || fabsf(rollOffset) > LEVEL_OFFSET_MAX) {
     modeReason = "offset LEVEL qua lon"; return false;
   }
@@ -1513,6 +2245,8 @@ static void updateAutoArm(float dt) {
     tripAngleT  = 0.0f;
     throttleCmd = IDLE_THROTTLE;
     mode        = FS_ARMED_IDLE;
+    transitionPhase = PHASE_NONE;
+    takeoffAttitudeProfileActive = false;
     modeReason  = "ARMED IDLE - cho TAKEOFF";
     armedIdleStartMs = millis();
     Serial.println("[ARM] ARMED IDLE - motor spool toi 1050us, cho TAKEOFF.");
@@ -1522,17 +2256,51 @@ static void updateAutoArm(float dt) {
 static void disarmNow(const char *reason) {
   mode = FS_DISARMED; modeReason = reason; armRequested = false;
   spoolRatio = armHoldT = 0.0f; altitudeSetpointM = 0.0f;
+  transitionPhase = PHASE_NONE; phaseElapsedS = 0.0f;
+  takeoffElapsedS = liftoffConfirmS = landedConfirmS = 0.0f;
+  takeoffLiftConfirmed = takeoffReachedClearance = false;
+  takeoffGroundUnsafeS = takeoffAttitudeTransferS = 0.0f;
+  takeoffAttitudeProfileActive = false;
+  altitudeThrottleSlewF = (float)IDLE_THROTTLE;
   resetControllers();
   escWriteAll(IDLE_THROTTLE, IDLE_THROTTLE, IDLE_THROTTLE, IDLE_THROTTLE);
 }
 
 static void startLanding(bool failsafe, const char *reason) {
+  // LAND lap lai khong duoc reset phase/timeout, va LAND thuong khong duoc ha
+  // cap mot FAILSAFE dang hoat dong. Chi cho phep nang mot LANDING len FAILSAFE.
+  if (mode == FS_LANDING || mode == FS_FAILSAFE) {
+    if (failsafe && mode == FS_LANDING) {
+      mode = FS_FAILSAFE;
+      modeReason = reason;
+      fsLanding = true;
+      Serial.printf("[FAILSAFE] %s (giu nguyen phase landing)\n", reason);
+    }
+    return;
+  }
   if (!airborne()) return;
+  const FlightMode priorMode = mode;
+  takeoffAttitudeProfileActive = false;
   mode = failsafe ? FS_FAILSAFE : FS_LANDING;
   modeReason = reason; fsLanding = failsafe;
   altitudeSetpointM = fmaxf(altitudeNow.altitudeM, 0.0f);
+  altitudeVelocitySetpointMps = 0.0f;
+  altitudeIntegral = altitudeCorrectionUs = 0.0f;
+  // Giu dung output hien tai; clamp ve hover o desired path va di qua slew,
+  // khong tao buoc giam ngay tai bien mode.
+  altitudeThrottleSlewF = (float)throttleCmd;
+  altitudeThrottleSlewLimited = false;
   landedConfirmS = 0.0f; blindLandStartMs = 0;
   landingStartMs = millis();
+  if (priorMode == FS_TAKEOFF && !takeoffLiftConfirmed) {
+    // Abort khi chua roi dat: khong chay altitude controller nhu dang airborne.
+    beginLandingMotorRamp();
+  } else if (altitudeNow.rangeFresh && altitudeNow.rangeAltitudeM <= ALT_LANDED_M) {
+    beginTouchdownDetection();
+  } else {
+    setTransitionPhase(landingNearGround() ? PHASE_LAND_GROUND_APPROACH :
+                                             PHASE_LAND_CONTROLLED_DESCENT);
+  }
   Serial.printf("[%s] %s\n", failsafe ? "FAILSAFE" : "LAND", reason);
 }
 
@@ -1582,17 +2350,28 @@ void espnowTask(void *arg) {
     const uint32_t now = millis();
     if (haveActionSequence && p.sequence == lastActionSequence &&
         p.command == lastActionCommand && (uint32_t)(now - lastActionMs) < 2000UL) continue;
-    haveActionSequence = true;
-    lastActionSequence = p.sequence;
-    lastActionCommand = p.command;
-    lastActionMs = now;
-    if (pendingCommand != CMD_KILL || p.command == CMD_KILL) {
+    bool published = false;
+    if (p.command == CMD_KILL) {
+      // KILL duoc phep thay the moi action chua claim; no khong co payload phu.
+      __atomic_store_n(&pendingCommand, (uint8_t)CMD_KILL, __ATOMIC_RELEASE);
+      published = true;
+    } else if (__atomic_load_n(&pendingCommand, __ATOMIC_ACQUIRE) == CMD_HEARTBEAT) {
+      // Single producer ghi payload truoc, roi CAS release moi cong bo command.
+      // Neu control/producer doi mailbox trong luc nay, packet lap lai se thu lai.
       pendingTargetCm = p.targetCm;
       pendingHoverUs = p.hoverUs;
-      __sync_synchronize();
-      pendingCommand = p.command;
+      uint8_t expected = CMD_HEARTBEAT;
+      published = __atomic_compare_exchange_n(&pendingCommand, &expected, p.command,
+                                               false, __ATOMIC_RELEASE,
+                                               __ATOMIC_RELAXED);
     }
-    lastCommand = p.command;
+    if (published) {
+      haveActionSequence = true;
+      lastActionSequence = p.sequence;
+      lastActionCommand = p.command;
+      lastActionMs = now;
+      lastCommand = p.command;
+    }
     espnowRx = espnowRx + 1;
   }
 }
@@ -1644,10 +2423,17 @@ static bool espnowInit() {
 
 // Xu ly command o core dieu khien. Task WiFi chi validate + ghi mailbox.
 static void handlePendingCommand() {
-  const uint8_t command = pendingCommand;
+  // Doc payload trong khi mailbox con occupied. Producer khong duoc sua payload
+  // cua non-KILL cho den khi exchange claim xong; KILL khong dung payload nay.
+  const uint8_t preview = __atomic_load_n(&pendingCommand, __ATOMIC_ACQUIRE);
+  if (preview == CMD_HEARTBEAT) return;
+  const uint16_t commandHoverUs = pendingHoverUs;
+  // Claim + clear cung mot thao tac. Command producer publish sau exchange van
+  // con trong mailbox, ke ca KILL, thay vi bi control xoa nham.
+  const uint8_t command = __atomic_exchange_n(&pendingCommand,
+                                               (uint8_t)CMD_HEARTBEAT,
+                                               __ATOMIC_ACQUIRE);
   if (command == CMD_HEARTBEAT) return;
-  __sync_synchronize();
-  pendingCommand = CMD_HEARTBEAT;
 
   switch (command) {
     case CMD_ARM:
@@ -1657,18 +2443,48 @@ static void handlePendingCommand() {
       }
       break;
     case CMD_TAKEOFF:
-      if (mode == FS_ARMED_IDLE && altitudeNow.rangeFresh && altitudeNow.baroFresh && linkUp &&
+      if (mode == FS_ARMED_IDLE && altitudeNow.rangeFresh && altitudeNow.baroFresh &&
+          altitudeNow.flowFresh && positionReferenceInitialized && linkUp &&
           fabsf(altitudeNow.altitudeM) <= 0.12f &&
           fabsf(pitch) <= ARM_MAX_ANGLE && fabsf(roll) <= ARM_MAX_ANGLE &&
           fabsf(pitchRate) <= ARM_MAX_RATE && fabsf(rollRate) <= ARM_MAX_RATE &&
           fabsf(yawRate) <= ARM_MAX_RATE) {
+        if (HOVER_THROTTLE <= TAKEOFF_START_US) {
+          Serial.printf("[CMD] TAKEOFF bi tu choi: hover %dus phai > moc ground %dus.\n",
+                        HOVER_THROTTLE, TAKEOFF_START_US);
+          break;
+        }
+        if (fmaxf(fabsf(pitch), fabsf(roll)) > TAKEOFF_GROUND_MAX_TILT_DEG) {
+          Serial.printf("[CMD] TAKEOFF bi tu choi: mat nghieng P/R %.1f/%.1f vuot %.1f deg.\n",
+                        pitch, roll, TAKEOFF_GROUND_MAX_TILT_DEG);
+          break;
+        }
         resetControllers();
+        takeoffGroundPitchDeg = pitch; takeoffGroundRollDeg = roll;
+        takeoffAttitudePitchSpDeg = pitch; takeoffAttitudeRollSpDeg = roll;
+        pitchSetpoint = pitch; rollSetpoint = roll;
+        lpf_preset(&pitchAxis.sp_lpf, pitchSetpoint);
+        lpf_preset(&rollAxis.sp_lpf, rollSetpoint);
+        takeoffGroundUnsafeS = takeoffAttitudeTransferS = 0.0f;
+        takeoffAttitudeProfileActive = true;
         spoolRatio = 0.0f;
+        // Bat dau tu output ARMED_IDLE that, khong nhay thang 1050 -> 1350 us.
+        takeoffThrottleF = (float)constrain(throttleCmd, IDLE_THROTTLE, HOVER_THROTTLE);
+        altitudeThrottleSlewF = takeoffThrottleF;
         altitudeSetpointM = fmaxf(0.0f, altitudeNow.altitudeM);
-        takeoffElapsedS = holdConfirmS = landedConfirmS = 0.0f;
+        takeoffElapsedS = phaseElapsedS = liftoffConfirmS = 0.0f;
+        holdConfirmS = landedConfirmS = 0.0f;
+        takeoffLiftConfirmed = takeoffReachedClearance = false;
         flightStartMs = millis(); fsLanding = false;
-        mode = FS_TAKEOFF; modeReason = "tu cat canh den 1.00m";
-        Serial.println("[CMD] TAKEOFF -> muc 1.00m.");
+        mode = FS_TAKEOFF; modeReason = "tu cat canh den 0.50m";
+        setTransitionPhase(takeoffThrottleF < (float)TAKEOFF_START_US
+                           ? PHASE_TAKEOFF_SPOOL_UP
+                           : PHASE_TAKEOFF_GROUND_TRANSITION);
+        Serial.printf("[CMD] TAKEOFF -> ramp lien tuc tu %.0fus qua moc %dus, %.0fus/s.\n",
+                      takeoffThrottleF, TAKEOFF_START_US, TAKEOFF_RAMP_US_PER_S);
+        Serial.printf("[TAKEOFF] Capture attitude P/R %.2f/%.2f deg; ground motor <= base+%.0fus.\n",
+                      takeoffGroundPitchDeg, takeoffGroundRollDeg,
+                      TAKEOFF_GROUND_MOTOR_DELTA_US);
       } else Serial.println("[CMD] TAKEOFF bi tu choi: chua ARMED IDLE/range/link.");
       break;
     case CMD_LAND:
@@ -1683,10 +2499,10 @@ static void handlePendingCommand() {
       tripStartM1 = tripStartM2 = tripStartM3 = tripStartM4 = IDLE_THROTTLE;
       break;
     case CMD_SET_HOVER:
-      if (mode == FS_DISARMED && pendingHoverUs >= HOVER_MIN_ALLOWED &&
-          pendingHoverUs <= HOVER_MAX_ALLOWED) {
-        hoverTarget = pendingHoverUs;
-        Serial.printf("[CMD] hover base=%u us\n", (unsigned)pendingHoverUs);
+      if (mode == FS_DISARMED && commandHoverUs >= HOVER_MIN_ALLOWED &&
+          commandHoverUs <= HOVER_MAX_ALLOWED) {
+        hoverTarget = commandHoverUs;
+        Serial.printf("[CMD] hover base=%u us\n", (unsigned)commandHoverUs);
       } else Serial.println("[CMD] HOVER bi tu choi: chi doi hop le khi DISARMED.");
       break;
     default: break;
@@ -1755,7 +2571,8 @@ static void telemPublish() {
                                 (loopOverrun   ? 0x02 : 0) |
                                 (imuCalibrated ? 0x04 : 0) |
                                 (clipCount     ? 0x08 : 0) |
-                                (espnowReady   ? 0x10 : 0));
+                                (espnowReady   ? 0x10 : 0) |
+                                (altitudeNow.flowFresh ? 0x20 : 0));
   telemShared.ms     = millis();
   telemShared.loopHz = loopHz;
   telemShared.seq    = ++telemCount;
@@ -1804,7 +2621,33 @@ static void telemPublish() {
   telemShared.altitudeSource = altitudeNow.source;
   telemShared.rangeStrength = altitudeNow.rangeStrength;
   telemShared.lastCommand = lastCommand;
-  telemShared.reserved = 0;
+  telemShared.transitionPhase = (uint8_t)transitionPhase;
+  telemShared.flowForwardMps = altitudeNow.flowForwardMps;
+  telemShared.flowRightMps = altitudeNow.flowRightMps;
+  telemShared.positionForwardM = positionForwardM;
+  telemShared.positionRightM = positionRightM;
+  telemShared.positionPitchDeg = positionPitchDeg;
+  telemShared.positionRollDeg = positionRollDeg;
+  telemShared.flowAgeMs = telemSat16(altitudeNow.flowAgeMs);
+  telemShared.flowQuality = altitudeNow.flowQuality;
+  telemShared.flowReserved = 0;
+  telemShared.altitudeVelocitySetpointMps = altitudeVelocitySetpointMps;
+  telemShared.altitudeIntegralUs = altitudeIntegral;
+  telemShared.configSignature = FLIGHT_CONFIG_SIGNATURE;
+  telemShared.controlDtUs = telemSat16(controlDtUs);
+  telemShared.controlDtMaxUs = telemSat16(controlDtMaxUs);
+  telemShared.controlOverruns = telemSat16(controlOverrunCount);
+  telemShared.mtfRateHz10 = altitudeNow.mtfRateHz10;
+  telemShared.mtfGapMaxUs = altitudeNow.mtfGapMaxUs;
+  telemShared.bmpRateHz10 = altitudeNow.bmpRateHz10;
+  telemShared.bmpReadMaxUs = altitudeNow.bmpReadMaxUs;
+  telemShared.auxWaitMaxUs = altitudeNow.auxWaitMaxUs;
+  telemShared.altitudeGapMaxUs = altitudeNow.altitudeGapMaxUs;
+  telemShared.uartBacklogMax = altitudeNow.uartBacklogMax;
+  telemShared.mtfBadCrc = altitudeNow.mtfBadCrc;
+  telemShared.mtfStale = altitudeNow.mtfStale;
+  telemShared.bmpReadFail = altitudeNow.bmpReadFail;
+  telemShared.auxLockMiss = altitudeNow.auxLockMiss;
 
   __sync_synchronize();
   telemSeq = telemSeq + 1;                 // -> chan: ban chup lanh lan
@@ -1862,15 +2705,75 @@ static const char *flightModeName(FlightMode m) {
   }
 }
 
+// Rut gon modeReason thanh ma <= 20 ky tu de biet dung nguyen nhan tren OLED.
+static const char *oledReasonName(const char *reason) {
+  if (!reason) return "UNKNOWN";
+  if (strstr(reason, "mat link"))             return "LINK LOST";
+  if (strstr(reason, "MTF01P mat"))           return "MTF LOST/STALE";
+  if (strstr(reason, "vuot tran cao"))        return "OVER ALT 1.60M";
+  if (strstr(reason, "qua thoi gian bay"))    return "FLIGHT TIMEOUT";
+  if (strstr(reason, "khong phat hien"))      return "NO LIFT";
+  if (strstr(reason, "takeoff timeout"))      return "TAKEOFF TIMEOUT";
+  if (strstr(reason, "blind landing"))        return "NO ALT SENSOR";
+  if (strstr(reason, "landing timeout"))      return "LAND TIMEOUT";
+  if (strstr(reason, "KILL"))                 return "KILL COMMAND";
+  if (strstr(reason, "Sai so goc"))           return "ATTITUDE ERROR";
+  if (strstr(reason, "Goc NaN"))              return "ATTITUDE NAN";
+  if (strstr(reason, "Attitude khong"))       return "ATTITUDE INVALID";
+  if (strstr(reason, "MPU6050"))              return "MPU LOST";
+  if (strstr(reason, "BMP388"))               return "BMP NOT READY";
+  if (strstr(reason, "MTF01P khong"))         return "MTF NOT READY";
+  if (strstr(reason, "flow khong"))           return "FLOW NOT READY";
+  if (strstr(reason, "moc vi tri"))           return "POS ORIGIN WAIT";
+  if (strstr(reason, "vi tri khong"))         return "POSITION INVALID";
+  if (strstr(reason, "cao do chua CAL"))      return "ALT NOT CAL";
+  if (strstr(reason, "chua co link"))         return "NO SENDER LINK";
+  if (strstr(reason, "chua hieu chuan"))      return "IMU NOT CAL";
+  if (strstr(reason, "cao do dat"))           return "GROUND NOT ZERO";
+  if (strstr(reason, "nam ngang") || strstr(reason, "LEVEL")) return "NOT LEVEL";
+  if (strstr(reason, "rung") || strstr(reason, "di chuyen")) return "MOVING/VIBRATION";
+  if (strstr(reason, "bao hoa"))              return "ACCEL CLIPPED";
+  if (strstr(reason, "ARM timeout"))           return "ARM TIMEOUT";
+  if (strstr(reason, "da khoa"))               return "SAFETY LOCKED";
+  if (strstr(reason, "failsafe landed"))       return "FAILSAFE LANDED";
+  if (strstr(reason, "landed"))                return "LANDED";
+  if (strstr(reason, "lenh LAND"))             return "LAND COMMAND";
+  if (strstr(reason, "ARMED IDLE"))            return "WAIT TAKEOFF";
+  if (strstr(reason, "xac nhan ARM"))          return "PREARM CHECK";
+  if (strstr(reason, "tu cat canh"))           return "TAKEOFF";
+  if (strstr(reason, "ALT HOLD"))              return "NORMAL";
+  if (strstr(reason, "cho lenh ARM"))          return "WAIT ARM";
+  return "SEE TERMINAL";
+}
+
+static const char *oledActionName(FlightMode mode) {
+  switch (mode) {
+    case FS_FAILSAFE:  return "SLOW LAND";
+    case FS_TRIPPED:   return "RESET REQUIRED";
+    case FS_LANDING:   return "SLOW LAND";
+    case FS_TAKEOFF:   return "CLIMB";
+    case FS_ALT_HOLD:  return "HOLD";
+    case FS_ARMED_IDLE:return "2=TAKEOFF";
+    default:           return "CHECK THEN 1=ARM";
+  }
+}
+
 static inline void oledPublish() {
   oledSeq = oledSeq + 1;
   __sync_synchronize();
-  oledShared.pitch = pitch; oledShared.roll = roll; oledShared.yaw = yawHeading;
-  oledShared.outP = lastP;  oledShared.outR = lastR; oledShared.outY = lastY;
+  oledShared.altitudeM = altitudeNow.altitudeM;
+  oledShared.altitudeSetpointM = altitudeSetpointM;
+  oledShared.verticalSpeedMps = altitudeNow.verticalSpeedMps;
+  oledShared.flowForwardMps = altitudeNow.flowForwardMps;
+  oledShared.flowRightMps = altitudeNow.flowRightMps;
+  oledShared.positionForwardM = positionForwardM;
+  oledShared.positionRightM = positionRightM;
   oledShared.throttle = throttleCmd;
-  oledShared.m1 = curM1; oledShared.m2 = curM2; oledShared.m3 = curM3; oledShared.m4 = curM4;
-  oledShared.loopHz = loopHz;
-  oledShared.mode   = mode;
+  oledShared.altitudeSource = altitudeNow.source;
+  oledShared.flowQuality = altitudeNow.flowQuality;
+  oledShared.mode = mode;
+  oledShared.linkUp = linkUp;
+  oledShared.flowFresh = altitudeNow.flowFresh;
   oledShared.reason = modeReason;
   __sync_synchronize();
   oledSeq = oledSeq + 1;
@@ -1890,34 +2793,56 @@ static bool oledRead(OledSnap *out) {
 
 void oledTask(void *arg) {
   (void)arg;
+  if (!auxI2cMutex) {
+    oledOK = false;
+    Serial.println("[OLED] Tat task: AUX mutex khong ton tai.");
+    vTaskDelete(NULL);
+    return;
+  }
+  Serial.printf("[SCHED] oled core=%d prio=%u\n", xPortGetCoreID(),
+                (unsigned)uxTaskPriorityGet(NULL));
   OledSnap s;
   for (;;) {
-    if (oledRead(&s) && oledOK) {
+    if (oledRead(&s) && oledOK &&
+        (s.mode == FS_DISARMED || s.mode == FS_ARMED_IDLE)) {
       display.clearDisplay();
       display.setCursor(0, 0);
       display.setTextSize(1);
 
+      // 1) Mode/link/throttle: phat hien failsafe va theo doi ramp 1350 -> hover.
       display.print(flightModeName(s.mode));
-      display.print(" T:"); display.print(s.throttle);
-      display.print(" ");   display.print(s.loopHz); display.println("Hz");
+      display.print(s.linkUp ? " L " : " X ");
+      display.print("T:"); display.println(s.throttle);
 
-      display.print("P:");  display.print(s.pitch, 1);
-      display.print(" R:"); display.print(s.roll, 1);
-      display.print(" Y:"); display.println(s.yaw, 0);
+      // 2) Cao do hien tai / setpoint.
+      display.print("Z:"); display.print(s.altitudeM, 2);
+      display.print(" SP:"); display.println(s.altitudeSetpointM, 2);
 
-      display.print("o:");  display.print(s.outP, 0);
-      display.print(" ");   display.print(s.outR, 0);
-      display.print(" ");   display.println(s.outY, 0);
+      // 3) Van toc dung + nguon fused/MTF/BMP/coast/none.
+      display.print("VZ:"); display.print(s.verticalSpeedMps, 2);
+      display.print(" SRC:");
+      display.println(s.altitudeSource == ALT_SOURCE_FUSED ? "F" :
+                      s.altitudeSource == ALT_SOURCE_MTF ? "M" :
+                      s.altitudeSource == ALT_SOURCE_BARO ? "B" :
+                      s.altitudeSource == ALT_SOURCE_COAST ? "C" : "-");
 
-      display.print("M1:");  display.print(s.m1);
-      display.print(" M2:"); display.println(s.m2);
-      display.print("M4:");  display.print(s.m4);
-      display.print(" M3:"); display.println(s.m3);
+      // 4) Van toc flow forward/right va quality.
+      display.print("F:"); display.print(s.flowForwardMps, 2);
+      display.print("/"); display.print(s.flowRightMps, 2);
+      display.print(" Q:"); display.println(s.flowQuality);
 
-      display.println(s.reason);
-      if (auxI2cMutex) xSemaphoreTake(auxI2cMutex, portMAX_DELAY);
-      display.display();
-      if (auxI2cMutex) xSemaphoreGive(auxI2cMutex);
+      // 5) Vi tri drift forward/right; H=hold dang khoa, -=flow khong dung duoc.
+      display.print("P:"); display.print(s.positionForwardM, 2);
+      display.print("/"); display.print(s.positionRightM, 2);
+      display.println(s.flowFresh ? " H" : " -");
+
+      // 6-7) Nguyen nhan + hanh dong: FAIL/SAFE khong con la ma mo ho.
+      display.print("WHY:"); display.println(oledReasonName(s.reason));
+      display.print("ACT:"); display.print(oledActionName(s.mode));
+      if (xSemaphoreTake(auxI2cMutex, 0) == pdTRUE) {
+        display.display();
+        xSemaphoreGive(auxI2cMutex);
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(OLED_MS));
   }
@@ -1956,8 +2881,24 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== DRONE_ALT_HOLD_1M (ESP32) ===");
+  Serial.printf("[BUILD] %s %s cfg=0x%08lX telem=v%u/%uB\n",
+                __DATE__, __TIME__, (unsigned long)FLIGHT_CONFIG_SIGNATURE,
+                (unsigned)TELEM_VER, (unsigned)sizeof(TelemPacket));
+  Serial.printf("[SCHED] setup/loop core=%d prio=%u\n", xPortGetCoreID(),
+                (unsigned)uxTaskPriorityGet(NULL));
+
+  // Tao xung idle truoc moi duong allocation/task co the dung han. Neu khoi tao
+  // sau do that bai, ESC van nhan 1000 us thay vi de chan floating/khong xung.
+  escInitTimer();
+  escAttach(ESC_PIN_M1, ESC_CH_M1);
+  escAttach(ESC_PIN_M2, ESC_CH_M2);
+  escAttach(ESC_PIN_M3, ESC_CH_M3);
+  escAttach(ESC_PIN_M4, ESC_CH_M4);
+  escWriteAll(IDLE_THROTTLE, IDLE_THROTTLE, IDLE_THROTTLE, IDLE_THROTTLE);
 
   auxI2cMutex = xSemaphoreCreateMutex();
+  if (!auxI2cMutex)
+    Serial.println("[AUX] CANH BAO: khong tao duoc mutex; BMP tiep tuc, OLED bi tat.");
   I2C_AUX.begin(AUX_SDA, AUX_SCL, AUX_FREQ);
   I2C_AUX.setTimeOut(10);
   bmpReady = beginBmp388();
@@ -1967,7 +2908,7 @@ void setup() {
   Serial.println("[MTF01P] UART1 115200, protocol phai la Micolink.");
 
 #if ENABLE_OLED
-  oledOK = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  oledOK = auxI2cMutex && display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   if (oledOK) {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -1975,8 +2916,10 @@ void setup() {
     display.setCursor(0, 0);
     display.println("Khoi dong...");
     display.display();
-  } else {
+  } else if (auxI2cMutex) {
     Serial.println("[WARN] Khong tim thay OLED.");
+  } else {
+    Serial.println("[OLED] Da tat vi AUX mutex khong san sang.");
   }
 #endif
 
@@ -1985,14 +2928,6 @@ void setup() {
     Serial.println("[FATAL] Khong tao duoc altitude task.");
     while (true) delay(500);
   }
-
-  // ESC truoc cam bien: giu xung hop le cho ESC cang som cang tot.
-  escInitTimer();
-  escAttach(ESC_PIN_M1, ESC_CH_M1);
-  escAttach(ESC_PIN_M2, ESC_CH_M2);
-  escAttach(ESC_PIN_M3, ESC_CH_M3);
-  escAttach(ESC_PIN_M4, ESC_CH_M4);
-  escWriteAll(IDLE_THROTTLE, IDLE_THROTTLE, IDLE_THROTTLE, IDLE_THROTTLE);
 
   espnowReady = espnowInit();
 
@@ -2051,9 +2986,14 @@ void setup() {
 #endif
 
 #if ENABLE_OLED
-  if (oledOK)
-    xTaskCreatePinnedToCore(oledTask, "oled", OLED_TASK_STACK, NULL,
-                            OLED_TASK_PRIO, &oledTaskHandle, OLED_TASK_CORE);
+  if (oledOK &&
+      xTaskCreatePinnedToCore(oledTask, "oled", OLED_TASK_STACK, NULL,
+                              OLED_TASK_PRIO, &oledTaskHandle,
+                              OLED_TASK_CORE) != pdPASS) {
+    oledTaskHandle = NULL;
+    oledOK = false;
+    Serial.println("[OLED] CANH BAO: khong tao duoc task; OLED da tat.");
+  }
 #endif
 
   pitchSetpoint = constrain(PITCH_TRIM_DEG, -TRIM_DEG_MAX, TRIM_DEG_MAX);
@@ -2077,8 +3017,22 @@ void setup() {
                 ANGLE_ACCEL_MAX, THRUST_EXPO, ANGLE_BOOST_ON);
   Serial.printf("[CFG] yaw headroom %.0f%% | trip khi sai so goc >%.0f do trong %.2fs\n",
                 YAW_HEADROOM_PCT * 100.0f, SAFE_ANGLE_ERR, SAFE_ANGLE_HOLD_S);
-  Serial.printf("[CFG] FAILSAFE: mat link/range -> LAND %.2fm/s; timeout %.0fs.\n",
-                ALT_LAND_SLEW_MPS, LAND_TIMEOUT_S);
+  Serial.printf("[CFG] CG COMP @hover P/R=%+.1f/%+.1fus | angle trim P/R=%+.2f/%+.2fdeg\n",
+                CG_PITCH_COMP_US_AT_HOVER, CG_ROLL_COMP_US_AT_HOVER,
+                PITCH_TRIM_DEG, ROLL_TRIM_DEG);
+  Serial.printf("[CFG] TILT TAKEOFF: admit %.0fdeg | abort %.0fdeg/%.0fdps %.2fs | "
+                "level %.1fdeg/s | motor base+%.0fus | transfer %.2fs\n",
+                TAKEOFF_GROUND_MAX_TILT_DEG, TAKEOFF_GROUND_ABORT_ANGLE_DEG,
+                TAKEOFF_GROUND_ABORT_RATE_DPS, TAKEOFF_GROUND_ABORT_CONFIRM_S,
+                TAKEOFF_LEVEL_SLEW_DEG_PER_S, TAKEOFF_GROUND_MOTOR_DELTA_US,
+                TAKEOFF_ATTITUDE_TRANSFER_S);
+  Serial.printf("[CFG] LAND: %.2fm/s, duoi %.0fcm -> %.2fm/s + ga giam %.0fus/s; timeout %.0fs.\n",
+                ALT_LAND_SLEW_MPS, LAND_NEAR_GROUND_M * 100.0f,
+                ALT_LAND_NEAR_SLEW_MPS, LAND_NEAR_THROTTLE_DOWN_US_PER_S,
+                LAND_TIMEOUT_S);
+  Serial.printf("[CFG] VERTICAL: takeoff sp %.2fm/s, vz up/down %.2f/%.2fm/s, accel %.2f/%.2fm/s2.\n",
+                ALT_SETPOINT_SLEW_MPS, ALT_VEL_MAX_UP_MPS, ALT_VEL_MAX_DOWN_MPS,
+                ALT_VEL_ACCEL_UP_MPS2, ALT_VEL_ACCEL_DOWN_MPS2);
   Serial.printf("[OK] Khong tu ARM. Gui ARM, doi %.0fs pre-arm, roi TAKEOFF. Muc cao %.2fm.\n",
                 ARM_CONFIRM_S, ALT_TARGET_M);
 
@@ -2163,7 +3117,9 @@ static void estimateAttitude(const ImuSample *m, float dt) {
   // Khong co la ban: huong yaw se troi cham theo bias con du.
   yawHeading = wrap180(yawHeading + yawRate * dt);
 
-  if (isnan(pitch) || isnan(roll)) tripSafety("Goc NaN");
+  if (!isfinite(pitch) || !isfinite(roll) || !isfinite(pitchRate) ||
+      !isfinite(rollRate) || !isfinite(yawRate) || !isfinite(yawHeading))
+    tripSafety("Attitude khong huu han");
   else checkAttitudeError(dt);
 }
 
@@ -2208,60 +3164,383 @@ static void updateAltitudeSafety(float dt) {
     tripSafety("landing timeout");
 }
 
+// Moc (0,0) duoc tao mot lan tai vi tri sau khi altitude/flow calibration xong.
+// Odometry tiep tuc theo moc nay ca khi DISARMED; vi vay khong di chuyen drone
+// sau calib neu muon diem calib la diem giu. Mat flow chi dong bang estimate,
+// khong duoc phep am tham tao moc moi.
+static void updateHorizontalOdometry(float dt) {
+  if (!altitudeNow.calibrated) {
+    if (positionReferenceInitialized) resetHorizontalReference();
+    return;
+  }
+  if (!positionReferenceInitialized) {
+    positionForwardM = positionRightM = 0.0f;
+    positionYawReferenceDeg = yawHeading;
+    positionReferenceInitialized = true;
+    Serial.printf("[POS] Moc calib da khoa, yaw=%.1f deg, flow=%s.\n",
+                  positionYawReferenceDeg,
+                  altitudeNow.flowFresh ? "OK" : "CHO");
+    return;
+  }
+  if (!altitudeNow.flowFresh) return;
+
+  const float yawDelta = wrap180(yawHeading - positionYawReferenceDeg) * DEG_TO_RAD;
+  const float cy = cosf(yawDelta), sy = sinf(yawDelta);
+  const float velocityRefForward = cy * altitudeNow.flowForwardMps -
+                                   sy * altitudeNow.flowRightMps;
+  const float velocityRefRight = sy * altitudeNow.flowForwardMps +
+                                 cy * altitudeNow.flowRightMps;
+  positionForwardM += velocityRefForward * dt;
+  positionRightM += velocityRefRight * dt;
+
+  // Numerical guard only; 2 m is not a mission envelope. Preserve direction
+  // rather than clamping each axis into a square.
+  const float estimateRadius = hypotf(positionForwardM, positionRightM);
+  if (!isfinite(estimateRadius)) {
+    resetHorizontalReference();
+  } else if (estimateRadius > POS_HOLD_ESTIMATE_LIMIT_M) {
+    const float scale = POS_HOLD_ESTIMATE_LIMIT_M / estimateRadius;
+    positionForwardM *= scale;
+    positionRightM *= scale;
+  }
+}
+
+// Optical flow da la m/s bat bien theo target cao do. Vong
+// position(m) -> velocity(m/s) -> tilt tao setpoint nho cho PID attitude.
+static void updatePositionHold(float dt, bool suppressHold) {
+  const float trimPitch = constrain(PITCH_TRIM_DEG, -TRIM_DEG_MAX, TRIM_DEG_MAX);
+  const float trimRoll = constrain(ROLL_TRIM_DEG, -TRIM_DEG_MAX, TRIM_DEG_MAX);
+  const float tiltStep = POS_HOLD_TILT_SLEW_DEG_PER_S * dt;
+
+  const bool flowOk = !suppressHold && altitudeNow.flowFresh && altitudeNow.rangeFresh &&
+                      positionReferenceInitialized &&
+                      altitudeNow.altitudeM >= POS_HOLD_MIN_ALT_M;
+  if (!flowOk) {
+    positionFlowLostS += dt;
+    // Cho phep coasting 0.35s giu nguyen goc phanh truoc khi reset hoan toan
+    if (!suppressHold && positionHoldActive && positionFlowLostS < 0.35f) {
+      pitchSetpoint = constrain(trimPitch + positionPitchDeg,
+                                -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+      rollSetpoint = constrain(trimRoll + positionRollDeg,
+                               -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+      return;
+    }
+    // Mat flow that su: giu estimate theo moc calib, nhung xoa demand controller
+    // va slew goc ve trim. Khi flow lai tot, confirm 0.20s truoc khi tro lai moc cu.
+    positionIntegralForward = positionIntegralRight = 0.0f;
+    positionFlowConfirmS = 0.0f;
+    positionHoldActive = false;
+    positionPitchDeg += constrain(-positionPitchDeg, -tiltStep, tiltStep);
+    positionRollDeg += constrain(-positionRollDeg, -tiltStep, tiltStep);
+    pitchSetpoint = constrain(trimPitch + positionPitchDeg,
+                              -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+    rollSetpoint = constrain(trimRoll + positionRollDeg,
+                             -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+    return;
+  }
+  positionFlowLostS = 0.0f;
+
+  // Khong khoa vi tri ngay tren frame flow dau tien sau mot dot mat du lieu.
+  positionFlowConfirmS = fminf(positionFlowConfirmS + dt, POS_HOLD_FLOW_CONFIRM_S);
+  if (!positionHoldActive) {
+    positionPitchDeg += constrain(-positionPitchDeg, -tiltStep, tiltStep);
+    positionRollDeg += constrain(-positionRollDeg, -tiltStep, tiltStep);
+    pitchSetpoint = constrain(trimPitch + positionPitchDeg,
+                              -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+    rollSetpoint = constrain(trimRoll + positionRollDeg,
+                             -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+    if (positionFlowConfirmS < POS_HOLD_FLOW_CONFIRM_S) return;
+    positionIntegralForward = positionIntegralRight = 0.0f;
+    positionPitchDeg = positionRollDeg = 0.0f;
+    positionHoldActive = true;
+  }
+
+  const float yawDelta = wrap180(yawHeading - positionYawReferenceDeg) * DEG_TO_RAD;
+  const float cy = cosf(yawDelta), sy = sinf(yawDelta);
+
+  // Sai so bang met nhan gain 1/s thanh velocity m/s. Khong chia cho 0.50 m:
+  // 50 cm la target cao do, khong phai dung sai vi tri ngang.
+  float desiredRefForward = -POS_HOLD_KP_PER_S * positionForwardM;
+  float desiredRefRight = -POS_HOLD_KP_PER_S * positionRightM;
+  const float desiredMagnitude = hypotf(desiredRefForward, desiredRefRight);
+  if (desiredMagnitude > POS_HOLD_MAX_VEL_MPS) {
+    const float velocityScale = POS_HOLD_MAX_VEL_MPS / desiredMagnitude;
+    desiredRefForward *= velocityScale;
+    desiredRefRight *= velocityScale;
+  }
+  // Truc co dinh -> body de so sanh voi velocity flow hien tai.
+  const float desiredForward = cy * desiredRefForward + sy * desiredRefRight;
+  const float desiredRight = -sy * desiredRefForward + cy * desiredRefRight;
+  const float errorForward = desiredForward - altitudeNow.flowForwardMps;
+  const float errorRight = desiredRight - altitudeNow.flowRightMps;
+
+  float rawForward = POS_HOLD_VEL_KP_DEG_PER_MPS * errorForward + positionIntegralForward;
+  float rawRight = POS_HOLD_VEL_KP_DEG_PER_MPS * errorRight + positionIntegralRight;
+  // Anti-windup: chi tich phan khi chua cham tran hoac sai so dang go I-term ve 0.
+  if (fabsf(rawForward) < POS_HOLD_MAX_TILT_DEG || rawForward * errorForward < 0.0f)
+    positionIntegralForward = constrain(positionIntegralForward +
+      POS_HOLD_VEL_KI_DEG_PER_M * errorForward * dt,
+      -POS_HOLD_I_LIMIT_DEG, POS_HOLD_I_LIMIT_DEG);
+  if (fabsf(rawRight) < POS_HOLD_MAX_TILT_DEG || rawRight * errorRight < 0.0f)
+    positionIntegralRight = constrain(positionIntegralRight +
+      POS_HOLD_VEL_KI_DEG_PER_M * errorRight * dt,
+      -POS_HOLD_I_LIMIT_DEG, POS_HOLD_I_LIMIT_DEG);
+
+  rawForward = POS_HOLD_VEL_KP_DEG_PER_MPS * errorForward + positionIntegralForward;
+  rawRight = POS_HOLD_VEL_KP_DEG_PER_MPS * errorRight + positionIntegralRight;
+  // Quality vua qua nguong dat 40% tham quyen; quality >=70 dat 100%.
+  const float flowConfidence = constrain(
+    0.40f + ((float)altitudeNow.flowQuality - (float)FLOW_MIN_QUALITY) / 50.0f,
+    0.35f, 1.0f);
+  const float targetPitch = POS_HOLD_PITCH_SIGN * flowConfidence *
+    constrain(rawForward, -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+  const float targetRoll = POS_HOLD_ROLL_SIGN * flowConfidence *
+    constrain(rawRight, -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+  positionPitchDeg += constrain(targetPitch - positionPitchDeg, -tiltStep, tiltStep);
+  positionRollDeg += constrain(targetRoll - positionRollDeg, -tiltStep, tiltStep);
+  pitchSetpoint = constrain(trimPitch + positionPitchDeg,
+                            -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+  rollSetpoint = constrain(trimRoll + positionRollDeg,
+                           -POS_HOLD_MAX_TILT_DEG, POS_HOLD_MAX_TILT_DEG);
+}
+
+static float moveToward(float value, float target, float maxStep) {
+  return value + constrain(target - value, -maxStep, maxStep);
+}
+
+// Reference capture/leveling rieng cho TAKEOFF. Estimator reference phai duoc
+// calibrate tren mat phang truoc; pitchOffset/rollOffset khong tach duoc mount
+// bias khoi do nghieng cua mat dat neu boot truc tiep tren mat nghieng.
+static bool updateTakeoffAttitudeProfile(float dt) {
+  if (mode != FS_TAKEOFF || !takeoffAttitudeProfileActive) return true;
+
+  const bool beforeLift = !takeoffLiftConfirmed;
+  if (beforeLift) {
+    const bool unsafeAngle = fmaxf(fabsf(pitch), fabsf(roll)) >
+                             TAKEOFF_GROUND_ABORT_ANGLE_DEG;
+    const bool unsafeRate = fmaxf(fabsf(pitchRate), fabsf(rollRate)) >
+                            TAKEOFF_GROUND_ABORT_RATE_DPS;
+    takeoffGroundUnsafeS = (unsafeAngle || unsafeRate)
+                         ? takeoffGroundUnsafeS + dt : 0.0f;
+    if (takeoffGroundUnsafeS >= TAKEOFF_GROUND_ABORT_CONFIRM_S) {
+      startLanding(true, unsafeAngle ? "ground tilt vuot gioi han"
+                                    : "ground attitude rate qua lon");
+      return false;
+    }
+  } else {
+    takeoffGroundUnsafeS = 0.0f;
+    takeoffAttitudeTransferS = fminf(TAKEOFF_ATTITUDE_TRANSFER_S,
+                                     takeoffAttitudeTransferS + dt);
+  }
+
+  const float trimPitch = constrain(PITCH_TRIM_DEG, -TRIM_DEG_MAX, TRIM_DEG_MAX);
+  const float trimRoll = constrain(ROLL_TRIM_DEG, -TRIM_DEG_MAX, TRIM_DEG_MAX);
+  if (transitionPhase == PHASE_TAKEOFF_SPOOL_UP && beforeLift) {
+    takeoffAttitudePitchSpDeg = takeoffGroundPitchDeg;
+    takeoffAttitudeRollSpDeg = takeoffGroundRollDeg;
+  } else {
+    const float step = TAKEOFF_LEVEL_SLEW_DEG_PER_S * dt;
+    takeoffAttitudePitchSpDeg = moveToward(takeoffAttitudePitchSpDeg, trimPitch, step);
+    takeoffAttitudeRollSpDeg = moveToward(takeoffAttitudeRollSpDeg, trimRoll, step);
+  }
+  pitchSetpoint = takeoffAttitudePitchSpDeg;
+  rollSetpoint = takeoffAttitudeRollSpDeg;
+
+  if (!beforeLift && takeoffAttitudeTransferS >= TAKEOFF_ATTITUDE_TRANSFER_S &&
+      fabsf(takeoffAttitudePitchSpDeg - trimPitch) < 0.01f &&
+      fabsf(takeoffAttitudeRollSpDeg - trimRoll) < 0.01f) {
+    takeoffAttitudeProfileActive = false;
+    Serial.println("[TAKEOFF] Attitude transfer complete; normal authority.");
+  }
+  return true;
+}
+
+static bool landingNearGround() {
+  // Uu tien clearance MTF da tru 12 cm; khi mat MTF dung BMP trong cua so fallback.
+  if (altitudeNow.rangeFresh) return altitudeNow.rangeAltitudeM <= LAND_NEAR_GROUND_M;
+  if (altitudeNow.source) return altitudeNow.altitudeM <= LAND_NEAR_GROUND_M;
+  return false;
+}
+
+static bool landingModeActive() {
+  return mode == FS_LANDING || mode == FS_FAILSAFE;
+}
+
+static void updateLandingPhaseFromAltitude() {
+  if (!landingModeActive() || transitionPhase == PHASE_LAND_TOUCHDOWN_DETECTION ||
+      transitionPhase == PHASE_LAND_MOTOR_RAMP_DOWN) return;
+  if (altitudeNow.rangeFresh && altitudeNow.rangeAltitudeM <= ALT_LANDED_M) {
+    // Latch: khong quay lai controller cao do neu frame sau cho thay drone nay len.
+    beginTouchdownDetection();
+  } else if (transitionPhase != PHASE_LAND_GROUND_APPROACH && landingNearGround()) {
+    setTransitionPhase(PHASE_LAND_GROUND_APPROACH);
+  } else if (transitionPhase == PHASE_NONE) {
+    setTransitionPhase(PHASE_LAND_CONTROLLED_DESCENT);
+  }
+}
+
+static int touchdownMotorCommand(int startUs, float elapsedS) {
+  const int reduced = startUs - (int)lroundf(LAND_TOUCHDOWN_DOWN_US_PER_S * elapsedS);
+  // Neu mixer da dua mot motor duoi MOTOR_MIN, tuyet doi khong tang no tro lai.
+  return startUs > MOTOR_MIN_US ? max(MOTOR_MIN_US, reduced) : startUs;
+}
+
+static void runTouchdownDetection(float dt) {
+  phaseElapsedS += dt;
+  throttleCmd = touchdownMotorCommand(landingRampStartThrottle, phaseElapsedS);
+  const int m1 = touchdownMotorCommand(landingRampStartM1, phaseElapsedS);
+  const int m2 = touchdownMotorCommand(landingRampStartM2, phaseElapsedS);
+  const int m3 = touchdownMotorCommand(landingRampStartM3, phaseElapsedS);
+  const int m4 = touchdownMotorCommand(landingRampStartM4, phaseElapsedS);
+  escWriteAll(m1, m2, m3, m4);
+  resetControllers();
+  lastP = lastR = lastY = 0.0f;
+
+  const bool stable = altitudeNow.rangeFresh &&
+                      altitudeNow.rangeAltitudeM <= ALT_LANDED_M &&
+                      fabsf(altitudeNow.verticalSpeedMps) <= ALT_LANDED_VZ_MPS;
+  landedConfirmS = stable ? landedConfirmS + dt : 0.0f;
+  if (landedConfirmS >= ALT_LANDED_CONFIRM_S ||
+      phaseElapsedS >= LAND_TOUCHDOWN_TIMEOUT_S)
+    beginLandingMotorRamp();
+}
+
+static void runLandingMotorRamp(float dt) {
+  phaseElapsedS += dt;
+  const float k = 1.0f - constrain(phaseElapsedS / LAND_MOTOR_RAMP_S, 0.0f, 1.0f);
+  throttleCmd = IDLE_THROTTLE +
+                (int)lroundf((landingRampStartThrottle - IDLE_THROTTLE) * k);
+  escWriteAll(IDLE_THROTTLE + (int)lroundf((landingRampStartM1 - IDLE_THROTTLE) * k),
+              IDLE_THROTTLE + (int)lroundf((landingRampStartM2 - IDLE_THROTTLE) * k),
+              IDLE_THROTTLE + (int)lroundf((landingRampStartM3 - IDLE_THROTTLE) * k),
+              IDLE_THROTTLE + (int)lroundf((landingRampStartM4 - IDLE_THROTTLE) * k));
+  resetControllers();
+  lastP = lastR = lastY = 0.0f;
+  if (phaseElapsedS >= LAND_MOTOR_RAMP_S)
+    disarmNow(fsLanding ? "failsafe landed" : "landed");
+}
+
 static int altitudeThrottle(float dt) {
-  if (mode == FS_TAKEOFF && spoolRatio < 1.0f) {
-    spoolRatio = fminf(1.0f, spoolRatio + dt / TAKEOFF_SPOOL_S);
-    const float smooth = spoolRatio * spoolRatio * (3.0f - 2.0f * spoolRatio);
-    altitudeSetpointM = fmaxf(0.0f, altitudeNow.altitudeM);
-    altitudeIntegral = altitudeCorrectionUs = 0.0f;
-    return MOTOR_MIN_US + (int)lroundf((HOVER_THROTTLE - MOTOR_MIN_US) * smooth);
+  if (mode == FS_TAKEOFF) {
+    takeoffElapsedS += dt;
+    phaseElapsedS += dt;
+    const bool liftPredicate = altitudeNow.source != ALT_SOURCE_NONE &&
+                               (altitudeNow.altitudeM >= TAKEOFF_LIFTOFF_M ||
+                                (altitudeNow.altitudeM >= 0.025f &&
+                                 altitudeNow.verticalSpeedMps >= TAKEOFF_LIFTOFF_VZ_MPS));
+    liftoffConfirmS = liftPredicate ? liftoffConfirmS + dt : 0.0f;
+
+    if (!takeoffLiftConfirmed) {
+      if (liftoffConfirmS >= TAKEOFF_LIFTOFF_CONFIRM_S) {
+        takeoffLiftConfirmed = true;
+        takeoffAttitudeTransferS = 0.0f;
+        spoolRatio = 1.0f;
+        altitudeSetpointM = fmaxf(0.0f, altitudeNow.altitudeM);
+        altitudeVelocitySetpointMps = 0.0f;
+        altitudeIntegral = altitudeCorrectionUs = 0.0f;
+        altitudeThrottleSlewF = takeoffThrottleF;
+        altitudeThrottleSlewLimited = false;
+        setTransitionPhase(PHASE_TAKEOFF_CONTROLLED_ASCENT);
+        Serial.printf("[TAKEOFF] Xac nhan roi dat %.2fs tai %.0fus.\n",
+                      liftoffConfirmS, takeoffThrottleF);
+      } else {
+        // SPOOL_UP va GROUND_TRANSITION dung cung slew tu output hien tai.
+        // Dat hover ma chua lift thi giu output va PI=0, khong tich setpoint 0.50m.
+        takeoffThrottleF = fminf((float)HOVER_THROTTLE,
+                                takeoffThrottleF + TAKEOFF_RAMP_US_PER_S * dt);
+        if (transitionPhase == PHASE_TAKEOFF_SPOOL_UP &&
+            takeoffThrottleF >= (float)TAKEOFF_START_US)
+          setTransitionPhase(PHASE_TAKEOFF_GROUND_TRANSITION);
+        const float span = fmaxf(1.0f, (float)HOVER_THROTTLE - (float)MOTOR_MIN_US);
+        spoolRatio = constrain((takeoffThrottleF - (float)MOTOR_MIN_US) / span, 0.0f, 1.0f);
+        altitudeSetpointM = fmaxf(0.0f, altitudeNow.altitudeM);
+        altitudeVelocitySetpointMps = 0.0f;
+        altitudeIntegral = altitudeCorrectionUs = 0.0f;
+        altitudeThrottleSlewF = takeoffThrottleF;
+        altitudeThrottleSlewLimited = false;
+
+        if (transitionPhase == PHASE_TAKEOFF_GROUND_TRANSITION &&
+            phaseElapsedS >= TAKEOFF_NO_RISE_S)
+          startLanding(true, "khong phat hien roi dat");
+        else if (takeoffElapsedS >= TAKEOFF_TIMEOUT_S)
+          startLanding(true, "takeoff timeout");
+        return (int)lroundf(takeoffThrottleF);
+      }
+    }
   }
 
   if (mode == FS_TAKEOFF) {
-    takeoffElapsedS += dt;
+    // CONTROLLED_ASCENT dung trajectory hien co; ALTITUDE_CAPTURE chi doi phase,
+    // khong tao buoc setpoint/velocity moi.
     altitudeSetpointM = fminf(ALT_TARGET_M, altitudeSetpointM + ALT_SETPOINT_SLEW_MPS * dt);
+    if (altitudeNow.altitudeM >= 0.20f) takeoffReachedClearance = true;
+    if (transitionPhase == PHASE_TAKEOFF_CONTROLLED_ASCENT &&
+        (altitudeSetpointM >= ALT_TARGET_M - ALT_HOLD_TOLERANCE_M ||
+         altitudeNow.altitudeM >= ALT_TARGET_M - ALT_HOLD_TOLERANCE_M))
+      setTransitionPhase(PHASE_TAKEOFF_ALTITUDE_CAPTURE);
 
-    if (takeoffElapsedS > TAKEOFF_NO_RISE_S && altitudeNow.source && altitudeNow.altitudeM < 0.15f)
-      startLanding(true, "khong phat hien roi dat");
-    else if (takeoffElapsedS > TAKEOFF_TIMEOUT_S)
+    if (takeoffReachedClearance && altitudeNow.source && altitudeNow.altitudeM < 0.15f)
+      startLanding(true, "roi xuong khi cat canh");
+    else if (takeoffElapsedS >= TAKEOFF_TIMEOUT_S)
       startLanding(true, "takeoff timeout");
 
-    if (fabsf(ALT_TARGET_M - altitudeNow.altitudeM) < ALT_HOLD_TOLERANCE_M &&
+    if (mode == FS_TAKEOFF &&
+        fabsf(ALT_TARGET_M - altitudeNow.altitudeM) < ALT_HOLD_TOLERANCE_M &&
         fabsf(altitudeNow.verticalSpeedMps) < 0.15f) {
       holdConfirmS += dt;
       if (holdConfirmS >= 0.6f) {
-        mode = FS_ALT_HOLD; modeReason = "ALT HOLD 1.00m";
+        mode = FS_ALT_HOLD; modeReason = "ALT HOLD 0.50m";
+        transitionPhase = PHASE_NONE;
+        phaseElapsedS = 0.0f;
         altitudeSetpointM = ALT_TARGET_M;
       }
     } else holdConfirmS = 0.0f;
   } else if (mode == FS_LANDING || mode == FS_FAILSAFE) {
-    altitudeSetpointM = fmaxf(0.0f, altitudeSetpointM - ALT_LAND_SLEW_MPS * dt);
+    phaseElapsedS += dt;
+    const float landRate = transitionPhase == PHASE_LAND_GROUND_APPROACH
+                           ? ALT_LAND_NEAR_SLEW_MPS : ALT_LAND_SLEW_MPS;
+    altitudeSetpointM = fmaxf(0.0f, altitudeSetpointM - landRate * dt);
   } else {
     altitudeSetpointM = ALT_TARGET_M;
   }
 
-  if (!altitudeNow.source) {
+  if (altitudeNow.source == ALT_SOURCE_NONE) {
+    // Giua ALT_COAST_MS va RANGE_FAILSAFE_MS, giu nguyen ga; safety se chuyen
+    // sang LAND neu MTF that su mat qua 800 ms. Khong dap ga theo moi khe packet.
+    if (mode != FS_LANDING && mode != FS_FAILSAFE) return throttleCmd;
     if (!blindLandStartMs) {
       blindLandStartMs = millis();
       blindLandStartThrottle = throttleCmd;
     }
     const float elapsed = (millis() - blindLandStartMs) * 0.001f;
     throttleCmd = max(MOTOR_MIN_US,
-                      (int)lroundf(blindLandStartThrottle - 35.0f * elapsed));
+                      (int)lroundf(blindLandStartThrottle -
+                                   BLIND_THROTTLE_DOWN_US_PER_S * elapsed));
+    altitudeThrottleSlewF = (float)throttleCmd;
+    altitudeThrottleSlewLimited = true;
     if ((uint32_t)(millis() - blindLandStartMs) >= BLIND_LAND_MS)
       tripSafety("blind landing timeout");
     return throttleCmd;
   }
   blindLandStartMs = 0;
 
-  const float posError = altitudeSetpointM - altitudeNow.altitudeM;
-  const float velocitySp = constrain(ALT_POS_KP * posError,
-                                     -ALT_VEL_MAX_DOWN_MPS, ALT_VEL_MAX_UP_MPS);
-  const float velocityError = velocitySp - altitudeNow.verticalSpeedMps;
-  const bool saturated = mixLimit.thr_hi || mixLimit.thr_lo;
+  const float posError = soft_deadband(altitudeSetpointM - altitudeNow.altitudeM,
+                                       ALT_POS_DEADBAND_M);
+  const float rawVelocitySp = constrain(ALT_POS_KP * posError,
+                                        -ALT_VEL_MAX_DOWN_MPS, ALT_VEL_MAX_UP_MPS);
+  const float velocityStep = (rawVelocitySp >= altitudeVelocitySetpointMps
+                              ? ALT_VEL_ACCEL_UP_MPS2 : ALT_VEL_ACCEL_DOWN_MPS2) * dt;
+  altitudeVelocitySetpointMps += constrain(rawVelocitySp - altitudeVelocitySetpointMps,
+                                           -velocityStep, velocityStep);
+  const float velocityError = soft_deadband(
+    altitudeVelocitySetpointMps - altitudeNow.verticalSpeedMps, ALT_VEL_DEADBAND_MPS);
+  // Co slew cua tick truoc cung la bao hoa actuator; neu bo qua, I-term se tich
+  // luy trong luc PWM dang bi gioi han toc do va lai gay vot ga sau do.
+  const bool saturated = mixLimit.thr_hi || mixLimit.thr_lo ||
+                         altitudeThrottleSlewLimited;
   const float pre = ALT_VEL_KP_US_PER_MPS * velocityError + altitudeIntegral;
-  const bool ownHigh = pre >= ALT_CORRECTION_LIMIT_US;
-  const bool ownLow = pre <= -ALT_CORRECTION_LIMIT_US;
+  const bool ownHigh = pre >= ALT_CORRECTION_UP_US;
+  const bool ownLow = pre <= -ALT_CORRECTION_DOWN_US;
   if ((!saturated && !ownHigh && !ownLow) || (ownHigh && velocityError < 0.0f) ||
       (ownLow && velocityError > 0.0f) ||
       (saturated && altitudeIntegral * velocityError < 0.0f)) {
@@ -2269,31 +3548,75 @@ static int altitudeThrottle(float dt) {
     altitudeIntegral = constrain(altitudeIntegral, -ALT_I_LIMIT_US, ALT_I_LIMIT_US);
   }
   altitudeCorrectionUs = constrain(ALT_VEL_KP_US_PER_MPS * velocityError + altitudeIntegral,
-                                   -ALT_CORRECTION_LIMIT_US, ALT_CORRECTION_LIMIT_US);
+                                   -ALT_CORRECTION_DOWN_US, ALT_CORRECTION_UP_US);
 
-  if ((mode == FS_LANDING || mode == FS_FAILSAFE) && altitudeNow.rangeFresh &&
-      altitudeNow.altitudeM <= ALT_LANDED_M &&
-      fabsf(altitudeNow.verticalSpeedMps) <= ALT_LANDED_VZ_MPS) {
-    landedConfirmS += dt;
-    if (landedConfirmS >= ALT_LANDED_CONFIRM_S) {
-      disarmNow(fsLanding ? "failsafe landed" : "landed");
-      return IDLE_THROTTLE;
-    }
-  } else landedConfirmS = 0.0f;
+  const bool landing = mode == FS_LANDING || mode == FS_FAILSAFE;
+  float desiredThrottle = (float)HOVER_THROTTLE + altitudeCorrectionUs;
+  if (landing) {
+    desiredThrottle = fminf(desiredThrottle,
+                            fminf((float)HOVER_THROTTLE + LAND_THROTTLE_HEADROOM_US,
+                                  LAND_THROTTLE_MAX_US));
+  } else {
+    // Trong TAKEOFF / ALT_HOLD khi da tren 0.40m, khong cat ga qua sau duoi HOVER
+    // tranh tinh trang phanh dot ngot lam hut luc nang roi tu do.
+    if (altitudeNow.altitudeM >= 0.40f)
+      desiredThrottle = fmaxf(desiredThrottle, (float)HOVER_THROTTLE - 35.0f);
+  }
+  desiredThrottle = constrain(desiredThrottle, (float)MOTOR_MIN_US,
+                              (float)HOVER_MAX_ALLOWED);
 
-  return constrain((int)lroundf((float)HOVER_THROTTLE + altitudeCorrectionUs),
-                   MOTOR_MIN_US, HOVER_MAX_ALLOWED);
+  // Slew hai chieu. Landing van co quyen tang nhe de ham roi, nhung khong con
+  // nhay tuc thoi len ga cao; tran tuyet doi landing mac dinh la 1470 us.
+  const float upRate = landing ? LAND_THROTTLE_UP_US_PER_S : ALT_THROTTLE_UP_US_PER_S;
+  const float downRate = landing
+    ? (landingNearGround() ? LAND_NEAR_THROTTLE_DOWN_US_PER_S
+                           : LAND_THROTTLE_DOWN_US_PER_S)
+    : ALT_THROTTLE_DOWN_US_PER_S;
+  const float maxStep = (desiredThrottle >= altitudeThrottleSlewF ? upRate : downRate) * dt;
+  const float throttleDelta = desiredThrottle - altitudeThrottleSlewF;
+  altitudeThrottleSlewLimited = fabsf(throttleDelta) > maxStep + 0.01f;
+  altitudeThrottleSlewF += constrain(throttleDelta, -maxStep, maxStep);
+  altitudeThrottleSlewF = constrain(altitudeThrottleSlewF, (float)MOTOR_MIN_US,
+                                    (float)HOVER_MAX_ALLOWED);
+  return (int)lroundf(altitudeThrottleSlewF);
 }
 
 static void runFlightControl(float dt) {
-  const bool spooling = (mode == FS_TAKEOFF && spoolRatio < 1.0f);
-  const float iGate = spooling ? 0.0f : 1.0f;
+  if (landingModeActive()) {
+    updateLandingPhaseFromAltitude();
+    if (transitionPhase == PHASE_LAND_TOUCHDOWN_DETECTION) {
+      runTouchdownDetection(dt);
+      return;
+    }
+    if (transitionPhase == PHASE_LAND_MOTOR_RAMP_DOWN) {
+      runLandingMotorRamp(dt);
+      return;
+    }
+  }
+
   throttleCmd = altitudeThrottle(dt);
   if (!airborne()) {
     escWriteAll(IDLE_THROTTLE, IDLE_THROTTLE, IDLE_THROTTLE, IDLE_THROTTLE);
     lastP = lastR = lastY = 0.0f;
     return;
   }
+  // altitudeThrottle() co the kich abort pre-lift ngay trong tick nay.
+  if (landingModeActive() && transitionPhase == PHASE_LAND_MOTOR_RAMP_DOWN) {
+    runLandingMotorRamp(dt);
+    return;
+  }
+
+  const bool groundTransition = mode == FS_TAKEOFF && !takeoffLiftConfirmed;
+  const bool profileWasActive = mode == FS_TAKEOFF && takeoffAttitudeProfileActive;
+  updatePositionHold(dt, groundTransition || landingModeActive() || profileWasActive);
+  if (!updateTakeoffAttitudeProfile(dt)) {
+    if (landingModeActive() && transitionPhase == PHASE_LAND_MOTOR_RAMP_DOWN)
+      runLandingMotorRamp(dt);
+    return;
+  }
+  const bool attitudeTransfer = mode == FS_TAKEOFF && takeoffLiftConfirmed &&
+                                takeoffAttitudeTransferS < TAKEOFF_ATTITUDE_TRANSFER_S;
+  const float iGate = (groundTransition || attitudeTransfer) ? 0.0f : 1.0f;
 
   lastP = cascaded_compute(&pitchAxis, pitchSetpoint, pitch, pitchRate, dt,
                            mixLimit.pitch, iGate);
@@ -2303,7 +3626,7 @@ static void runFlightControl(float dt) {
   // Giu huong: dang spool hoac co lenh xoay thi moc bam theo huong hien tai.
   float yawSp = constrain(yawRateSetpoint, -MAX_YAW_RATE, MAX_YAW_RATE);
   if (YAW_ANGLE_KP > 0.0f) {
-    if (spooling || fabsf(yawRateSetpoint) > 1.0f) {
+    if (groundTransition || fabsf(yawRateSetpoint) > 1.0f) {
       yawHold = yawHeading;
     } else {
       yawSp = constrain(sqrt_controller(wrap180(yawHold - yawHeading),
@@ -2315,24 +3638,42 @@ static void runFlightControl(float dt) {
   lastY = pid_compute(&yawRatePid, yawSp, yawRate, dt, mixLimit.yaw);
 
   int m1, m2, m3, m4;
-  motor_mix(angleBoost((float)throttleCmd),
-            lastP * MIX_PITCH_SIGN, lastR * MIX_ROLL_SIGN, lastY * MIX_YAW_SIGN,
-            &m1, &m2, &m3, &m4);
+  // PID xu ly sai so dong; feed-forward xu ly moment tai tinh do pin/CG lech.
+  // Tach hai thanh phan tranh dung angle trim (gay gia toc ngang) hoac tang
+  // Kp/Kd (gay rung) de chua mot tai gan nhu hang dinh.
+  const float pMix = lastP * MIX_PITCH_SIGN + cgPitchCompensation((float)throttleCmd);
+  const float rMix = lastR * MIX_ROLL_SIGN + cgRollCompensation((float)throttleCmd);
+  const float yMix = lastY * MIX_YAW_SIGN;
+  if (groundTransition) {
+    motorMixGroundLimited((float)throttleCmd, pMix, rMix, yMix, &m1, &m2, &m3, &m4);
+  } else if (attitudeTransfer) {
+    const float alpha = takeoffAttitudeTransferS / TAKEOFF_ATTITUDE_TRANSFER_S;
+    motorMixTakeoffTransfer((float)throttleCmd, pMix, rMix, yMix, alpha,
+                            &m1, &m2, &m3, &m4);
+  } else {
+    motor_mix(angleBoost((float)throttleCmd), pMix, rMix, yMix, &m1, &m2, &m3, &m4);
+  }
   escWriteAll(m1, m2, m3, m4);
 }
 
 // Mot chu ky dieu khien. Thu tu ArduPilot: uoc luong -> dieu khien -> XUAT MOTOR,
 // moi viec phu (telemetry/serial/OLED) day xuong sau cung.
 static void controlTick(uint32_t nowUs) {
-  float dt = (float)(nowUs - lastCtrlUs) * 1e-6f;
+  const uint32_t rawDtUs = nowUs - lastCtrlUs;
+  controlDtUs = rawDtUs;
+  if (rawDtUs > controlDtMaxUs) controlDtMaxUs = rawDtUs;
+  float dt = (float)rawDtUs * 1e-6f;
   lastCtrlUs = nowUs;
   dt = constrain(dt, 0.0005f, 0.05f);
 
-  altitudeRead(&altitudeNow);
-  if (!altitudeNow.publishedMs || (uint32_t)(millis() - altitudeNow.publishedMs) > 100UL) {
-    altitudeNow.source = 0;
-    altitudeNow.rangeFresh = altitudeNow.baroFresh = false;
-    altitudeNow.rangeAgeMs = altitudeNow.baroAgeMs = UINT32_MAX;
+  if (!altitudeRead(&altitudeNow))
+    __atomic_add_fetch(&altitudeSnapshotReadFailCount, 1UL, __ATOMIC_RELAXED);
+  sanitizeAltitudeSnapshot(&altitudeNow);
+  if (!altitudeNow.publishedMs ||
+      (uint32_t)(millis() - altitudeNow.publishedMs) > ALTITUDE_SNAPSHOT_STALE_MS) {
+    altitudeNow.source = ALT_SOURCE_NONE;
+    altitudeNow.rangeFresh = altitudeNow.baroFresh = altitudeNow.flowFresh = false;
+    altitudeNow.rangeAgeMs = altitudeNow.baroAgeMs = altitudeNow.flowAgeMs = UINT32_MAX;
   }
   updateThrottleAndLink(dt);
 
@@ -2344,8 +3685,14 @@ static void controlTick(uint32_t nowUs) {
   if (imuOk) {
     ctrlCount++;
     estimateAttitude(&mean, dt);
-    altitudeTiltCos = cosf(pitch * DEG_TO_RAD) * cosf(roll * DEG_TO_RAD);
+    altitudeTiltCos = (isfinite(pitch) && isfinite(roll))
+                    ? cosf(pitch * DEG_TO_RAD) * cosf(roll * DEG_TO_RAD)
+                    : 1.0f;
   }
+
+  // Odometry chay doc lap flight mode de moc ngang la vi tri calib, khong phai
+  // frame flow dau tien sau khi da roi dat.
+  updateHorizontalOdometry(dt);
 
   updateAltitudeSafety(dt);
 
@@ -2386,6 +3733,7 @@ void loop() {
   if ((int32_t)(nowUs - nextSampleUs) > (int32_t)SAMPLE_US) {
     nextSampleUs = nowUs + SAMPLE_US;      // tre qua 1 chu ky -> bo nhip lo
     loopOverrun  = true;
+    controlOverrunCount++;
   } else {
     nextSampleUs += SAMPLE_US;
     loopOverrun   = false;
